@@ -173,7 +173,13 @@ def _find_process_on_port(port: int) -> int | None:
         try:
             result = subprocess.run(
                 ["netstat", "-aon"],
+                # GOTCHA(2026-06-04): netstat output uses the Windows OEM console
+                # codepage (cp850 on FR Windows), NOT the ANSI cp1252 that text=True
+                # assumes. The "État" header byte 0x90 crashed the reader thread with
+                # UnicodeDecodeError, leaving stdout=None so no PID was ever found and
+                # `memory restart` could never free the port (Errno 10048 loop).
                 capture_output=True, text=True, timeout=5,
+                encoding="oem", errors="replace",
             )
             for line in result.stdout.splitlines():
                 if f":{port} " in line and "LISTENING" in line:
@@ -189,7 +195,10 @@ def _find_process_on_port(port: int) -> int | None:
         try:
             result = subprocess.run(
                 ["lsof", "-i", f":{port}", "-t"],
+                # GOTCHA(2026-06-04): tolerate non-UTF8 bytes in locale output
+                # (same class of bug as the win32 netstat path above).
                 capture_output=True, text=True, timeout=5,
+                errors="replace",
             )
             if result.stdout.strip():
                 return int(result.stdout.strip().splitlines()[0])
