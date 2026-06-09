@@ -42,6 +42,26 @@ if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
+# Single-instance guard.
+# GOTCHA(2026-06-09): the 5-min scheduler tick and the Claude session hooks can
+# both spawn this wrapper. Overlapping instances collided on the shared log
+# files ("file in use by another process"), killed each other's restart loops
+# and ended in "Max restart attempts reached. Giving up." while no server ran.
+# A named mutex guarantees only one wrapper manages the server lifecycle; the
+# OS releases it automatically when the process exits.
+$script:WrapperMutex = New-Object System.Threading.Mutex($false, "Global\MCPMemoryHTTPServerWrapper")
+$MutexAcquired = $false
+try {
+    $MutexAcquired = $script:WrapperMutex.WaitOne(2000)
+} catch [System.Threading.AbandonedMutexException] {
+    # Previous holder died without releasing - we now own it.
+    $MutexAcquired = $true
+}
+if (-not $MutexAcquired) {
+    # Another wrapper instance is already managing the server. Nothing to do.
+    exit 0
+}
+
 # Logging function
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -102,23 +122,30 @@ function Find-Executable {
     return $null
 }
 
-# Check if server is already running
-function Test-ServerRunning {
-    if (Test-Path $PidFile) {
-        $StoredPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-        if ($StoredPid) {
-            $Process = Get-Process -Id $StoredPid -ErrorAction SilentlyContinue
-            if ($Process -and $Process.ProcessName -like "*python*") {
-                return $true
-            }
-        }
+# Find every live process belonging to OUR server (uv parent or python child),
+# identified by command line - never by PID file alone.
+function Get-ServerProcesses {
+    try {
+        @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -match 'run_http_server\.py' })
+    } catch {
+        @()
     }
+}
 
-    # Also check via HTTP health endpoint (URL derived from .env)
+# Check if server is already running.
+# DECISION(2026-06-09): HTTP health is the ONLY proof of life. The previous
+# implementation trusted the PID file first ($Process.ProcessName -like
+# "*python*"): when the server died and Windows recycled that PID for any other
+# python process (NotebookLM CLI spawns dozens), every 5-min tick said
+# "already running" forever and the dead server was never restarted - the user
+# had to reconnect the memory MCP manually at every Claude session.
+function Test-ServerRunning {
+    # 1. HTTP health endpoint (URL derived from .env) = source of truth
     try {
         $healthParams = @{
             Uri = $ServerConfig.HealthUrl
-            TimeoutSec = 2
+            TimeoutSec = 5
             UseBasicParsing = $true
             ErrorAction = 'SilentlyContinue'
         } + $McpWebExtras
@@ -127,7 +154,34 @@ function Test-ServerRunning {
             return $true
         }
     } catch {
-        # Server not responding
+        # Server not responding over HTTP
+    }
+
+    # 2. HTTP is down. Is a genuine server process around?
+    $ServerProcs = Get-ServerProcesses
+    if ($ServerProcs.Count -gt 0) {
+        $Youngest = $ServerProcs | Sort-Object CreationDate -Descending | Select-Object -First 1
+        $AgeSeconds = [int]((Get-Date) - $Youngest.CreationDate).TotalSeconds
+
+        # Cold start takes ~30-60s (ONNX model load). Leave a starting server alone.
+        if ($AgeSeconds -lt 120) {
+            Write-Log "Server process PID $($Youngest.ProcessId) started ${AgeSeconds}s ago - cold start in progress, not restarting."
+            return $true
+        }
+
+        # Process alive > 120s but HTTP dead = zombie (seen 2026-06-09: port
+        # closed while the process survived, likely after sleep/resume).
+        # Kill the whole tree so the restart below binds the port cleanly.
+        foreach ($Proc in $ServerProcs) {
+            Write-Log "Killing zombie server process tree PID $($Proc.ProcessId) (alive ${AgeSeconds}s, HTTP dead)" "WARN"
+            taskkill /PID $Proc.ProcessId /T /F 2>$null | Out-Null
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    # Stale PID file is meaningless at this point
+    if (Test-Path $PidFile) {
+        Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
     }
 
     return $false
@@ -234,7 +288,45 @@ while ($RestartCount -lt $MaxRestarts) {
         Set-Content -Path $PidFile -Value $Process.Id
         Write-Log "Server started with PID $($Process.Id)"
 
-        # Wait for process to exit
+        # Watchdog loop: wait for exit OR detect a zombie (process alive, HTTP
+        # dead). GOTCHA(2026-06-09): after sleep/resume the uvicorn listener can
+        # die while the python process survives; the old blocking WaitForExit
+        # never noticed, the wrapper held the single-instance mutex forever and
+        # the dead server was never restarted.
+        $ConsecutiveHealthFailures = 0
+        while (-not $Process.HasExited) {
+            if ($Process.WaitForExit(30000)) { break }
+
+            # Grace period for cold start (ONNX model load ~30-60s)
+            $UptimeSeconds = [int]((Get-Date) - $Process.StartTime).TotalSeconds
+            if ($UptimeSeconds -lt 120) { continue }
+
+            $Healthy = $false
+            try {
+                $healthParams = @{
+                    Uri = $ServerConfig.HealthUrl
+                    TimeoutSec = 5
+                    UseBasicParsing = $true
+                } + $McpWebExtras
+                $Response = Invoke-WebRequest @healthParams
+                if ($Response.StatusCode -eq 200) { $Healthy = $true }
+            } catch {
+                # HTTP dead while process alive
+            }
+
+            if ($Healthy) {
+                $ConsecutiveHealthFailures = 0
+            } else {
+                $ConsecutiveHealthFailures++
+                Write-Log "Health check failed ($ConsecutiveHealthFailures/3) while server PID $($Process.Id) is alive" "WARN"
+                if ($ConsecutiveHealthFailures -ge 3) {
+                    Write-Log "Zombie server detected (process alive, HTTP dead ~90s). Killing process tree to restart." "ERROR"
+                    taskkill /PID $Process.Id /T /F 2>$null | Out-Null
+                }
+            }
+        }
+
+        # Final blocking wait so the exit code is reliably available
         $Process.WaitForExit()
         $ExitCode = $Process.ExitCode
 
