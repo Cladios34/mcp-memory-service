@@ -124,10 +124,16 @@ function Find-Executable {
 
 # Find every live process belonging to OUR server (uv parent or python child),
 # identified by command line - never by PID file alone.
+# GOTCHA(2026-07-13): the actual port-8000 listener runs as
+# "python -m uvicorn mcp_memory_service.web.app:app", NOT run_http_server.py.
+# Matching only the launcher script left orphaned uvicorn children invisible:
+# they kept the port and the log file, every restart attempt died on
+# WinError 10048 / "file in use", and the wrapper gave up while a half-dead
+# server still held the socket (incident 2026-07-13 09:31 + 13:58).
 function Get-ServerProcesses {
     try {
         @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -match 'run_http_server\.py' })
+            Where-Object { $_.CommandLine -and $_.CommandLine -match 'run_http_server\.py|uvicorn\s+mcp_memory_service\.web\.app' })
     } catch {
         @()
     }
@@ -208,6 +214,15 @@ Load-EnvFile
 # Restart loop
 $RestartCount = 0
 while ($RestartCount -lt $MaxRestarts) {
+    # GOTCHA(2026-07-13): re-check before every retry. After a crash, an
+    # orphaned uvicorn child (or a server started by another launcher, e.g. a
+    # Claude session hook) may already hold port 8000. Starting blindly ended
+    # in 10048 bind failures until "Giving up" while a server was in fact
+    # coming back up. Test-ServerRunning also sweeps genuine zombies.
+    if ($RestartCount -gt 0 -and (Test-ServerRunning)) {
+        Write-Log "A healthy server is already running (started outside this attempt). Exiting." "WARN"
+        exit 0
+    }
     Write-Log "Starting HTTP server (attempt $($RestartCount + 1)/$MaxRestarts)..."
 
     try {
@@ -263,10 +278,19 @@ while ($RestartCount -lt $MaxRestarts) {
         # previous attempt's output is preserved when the server crashes and
         # restarts. Start-Process overwrites the target file, so without this
         # the crash log from iteration N would be silently deleted by iteration N+1.
-        if (Test-Path $PythonLogFile) {
-            $OldPythonLog = "$PythonLogFile.old"
-            if (Test-Path $OldPythonLog) { Remove-Item $OldPythonLog -Force }
-            Rename-Item $PythonLogFile $OldPythonLog
+        # GOTCHA(2026-07-13): rotation must never kill the whole start attempt.
+        # An orphaned child can still hold the log handle right after a kill;
+        # the resulting "file in use" exception used to land in the outer catch
+        # and burn one of the 3 restart attempts without even trying to start.
+        try {
+            if (Test-Path $PythonLogFile) {
+                $OldPythonLog = "$PythonLogFile.old"
+                if (Test-Path $OldPythonLog) { Remove-Item $OldPythonLog -Force }
+                Rename-Item $PythonLogFile $OldPythonLog
+            }
+        } catch {
+            $PythonLogFile = Join-Path $LogDir ("http-server-python.{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+            Write-Log "Python log locked by another process; using $PythonLogFile for this attempt" "WARN"
         }
 
         # Separate file for stderr — Start-Process can't merge streams
