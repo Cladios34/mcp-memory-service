@@ -195,7 +195,7 @@ class MetadataMixin:
             return False, error_msg
 
     async def update_memories_batch(self, memories: List[Memory], preserve_timestamps: bool = False) -> List[bool]:
-        """Update multiple memories in a single database transaction."""
+        """Update multiple memories atomically in a single database transaction."""
         if not memories:
             return []
 
@@ -209,8 +209,10 @@ class MetadataMixin:
 
             def _batch_update():
                 cursor = self.conn.cursor()
-                for idx, memory in enumerate(memories):
-                    try:
+                savepoint = f"update_memories_batch_{os.urandom(4).hex()}"
+                cursor.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    for idx, memory in enumerate(memories):
                         cursor.execute(
                             """
                             SELECT content, tags, memory_type, metadata, created_at, created_at_iso,
@@ -222,8 +224,9 @@ class MetadataMixin:
 
                         row = cursor.fetchone()
                         if not row:
-                            logger.warning(f"Memory {memory.content_hash} not found during batch update")
-                            continue
+                            raise ValueError(
+                                f"Memory {memory.content_hash} not found during batch update"
+                            )
 
                         (content, current_tags, current_type, current_metadata_str,
                          created_at, created_at_iso, current_updated_at, current_updated_at_iso) = row
@@ -266,14 +269,18 @@ class MetadataMixin:
                                 memory.content_hash,
                             ),
                         )
-
+                        if cursor.rowcount != 1:
+                            raise RuntimeError(
+                                f"Memory {memory.content_hash} was not updated during batch update"
+                            )
                         results[idx] = True
 
-                    except Exception as e:
-                        logger.warning(f"Failed to update memory {memory.content_hash} in batch: {e}")
-                        continue
-
-                self.conn.commit()
+                    cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    self.conn.commit()
+                except Exception:
+                    cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    raise
 
             await self._execute_with_retry(_batch_update)
 

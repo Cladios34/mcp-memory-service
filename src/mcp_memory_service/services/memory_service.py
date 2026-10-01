@@ -54,6 +54,9 @@ def _sanitize_log_value(value: str) -> str:
 _MAX_JSON_LENGTH = 4096  # 4KB limit for tag JSON to prevent DoS
 _MAX_TAG_LENGTH = 100    # Maximum length for individual tags
 _MAX_TAGS_PER_MEMORY = 100  # Maximum number of tags per memory
+_MISTAKE_NOTE_TAG = "mistake-note"
+_MISTAKE_SEARCH_CANDIDATE_FLOOR = 50
+_MISTAKE_SEARCH_CANDIDATE_MULTIPLIER = 8
 
 
 def normalize_tags(tags: Union[str, List[str], None]) -> List[str]:
@@ -384,6 +387,8 @@ class MemoryService:
         conversation_id: Optional[str] = None,
         agent_id: Optional[str] = None,
         store: str = "default",
+        skip_semantic_dedup: bool = False,
+        require_all_chunks: bool = False,
     ) -> Union[StoreMemorySingleSuccess, StoreMemoryChunkedSuccess, StoreMemoryFailure]:
         """
         Store a new memory with validation and content processing.
@@ -403,6 +408,10 @@ class MemoryService:
             conversation_id: Optional conversation identifier. When supplied, semantic
                 deduplication is skipped so all turns of the same conversation
                 can be saved independently. Exact hash dedup is always preserved.
+            skip_semantic_dedup: Bypass cross-memory semantic deduplication. Intended
+                for callers that already perform a narrower, type-aware deduplication.
+            require_all_chunks: Roll back newly stored chunks if any chunk fails.
+                Use for logical records that are invalid when only partially stored.
 
         Returns:
             Dictionary with operation result
@@ -431,7 +440,7 @@ class MemoryService:
                 final_metadata["hostname"] = client_hostname
 
             # Store conversation_id in metadata for future grouping/retrieval
-            skip_dedup = bool(conversation_id) or (memory_type == "session")
+            skip_dedup = skip_semantic_dedup or bool(conversation_id) or (memory_type == "session")
             if conversation_id:
                 final_metadata["conversation_id"] = conversation_id
 
@@ -456,7 +465,12 @@ class MemoryService:
                 chunks = split_content(
                     content,
                     max_length=max_length,
-                    preserve_boundaries=CONTENT_PRESERVE_BOUNDARIES,
+                    # Boundary-preserving splitting trims whitespace around each
+                    # boundary. Mistake notes are reconstructed for users, so use
+                    # character-exact chunks and let the join remove only overlap.
+                    preserve_boundaries=(
+                        False if memory_type == "mistake" else CONTENT_PRESERVE_BOUNDARIES
+                    ),
                     overlap=CONTENT_SPLIT_OVERLAP
                 )
                 stored_memories = []
@@ -488,6 +502,28 @@ class MemoryService:
                                 logger.debug("Background quality scoring for chunk failed silently: %s", _sanitize_log_value(str(e)))
                     else:
                         failed_chunks.append({"index": i, "reason": message})
+
+                if failed_chunks and require_all_chunks:
+                    reasons = ", ".join(set(fc["reason"] for fc in failed_chunks))
+                    cleanup_failures = []
+                    for stored_memory in stored_memories:
+                        stored_hash = stored_memory.get("content_hash", "")
+                        if not stored_hash:
+                            continue
+                        deleted, delete_message = await self.storage.delete(stored_hash)
+                        if not deleted:
+                            cleanup_failures.append(f"{stored_hash}: {delete_message}")
+
+                    cleanup_detail = ""
+                    if cleanup_failures:
+                        cleanup_detail = f"; rollback failures: {'; '.join(cleanup_failures)}"
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Failed to store all {len(chunks)} chunks: {reasons}"
+                            f"{cleanup_detail}"
+                        ),
+                    }
 
                 # If NO chunks were stored, return failure
                 if not stored_memories:
@@ -774,9 +810,8 @@ class MemoryService:
             Dictionary with search results
         """
         try:
-            # Retrieve memories using semantic search
-            # Note: storage.retrieve() only supports query and n_results
-            # We'll filter by tags/type after retrieval if needed
+            # Retrieve memories using semantic search. Filtering remains at the
+            # service layer for backward compatibility with storage adapters.
             memories = await self.storage.retrieve(
                 query=query,
                 n_results=n_results
@@ -1038,6 +1073,282 @@ class MemoryService:
 
     # ─── Mistake Notes ────────────────────────────────────────────────
 
+    @staticmethod
+    def _mistake_metadata(memory: Memory) -> Dict[str, Any]:
+        """Return mistake metadata as a mutable dictionary."""
+        metadata = memory.metadata or {}
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata) if metadata else {}
+                return parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    @classmethod
+    def _mistake_group_key(cls, memory: Memory) -> str:
+        """Identify every auto-split fragment that belongs to one mistake note."""
+        metadata = cls._mistake_metadata(memory)
+        return str(metadata.get("original_hash") or memory.content_hash)
+
+    @staticmethod
+    def _mistake_numeric_value(value: Any, default: float) -> float:
+        """Normalize legacy JSON numeric strings without breaking group search."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _join_mistake_chunks(
+        chunks: List[str],
+        expected_hash: Optional[str] = None,
+    ) -> str:
+        """Reassemble chunks, including legacy boundary-trimmed mistake notes."""
+        if not chunks:
+            return ""
+
+        content = chunks[0]
+        joins: List[tuple[int, str]] = []
+        for chunk in chunks[1:]:
+            max_overlap = min(CONTENT_SPLIT_OVERLAP, len(content), len(chunk))
+            overlap = 0
+            for size in range(max_overlap, 0, -1):
+                if content[-size:] == chunk[:size]:
+                    overlap = size
+                    break
+            remainder = chunk[overlap:]
+            joins.append((overlap, remainder))
+            content += remainder
+
+        if not expected_hash or generate_content_hash(content) == expected_hash:
+            return content
+
+        # Older boundary-preserving chunks used rstrip/lstrip and therefore
+        # discarded their separator. Rebuild the common word/sentence and
+        # structured-field boundaries. New exact-overlap chunks return above.
+        content = chunks[0]
+        field_prefixes = ("Context:", "Wrong:", "Right:")
+        for _, remainder in joins:
+            if content and remainder and not content[-1].isspace() and not remainder[0].isspace():
+                if remainder.startswith(field_prefixes):
+                    content += "\n"
+                elif content[-1].isalnum() or content[-1] in ".!?;,:":
+                    content += " "
+            content += remainder
+        return content
+
+    @classmethod
+    def _build_mistake_group(
+        cls,
+        key: str,
+        members: List[Memory],
+        relevance: float,
+    ) -> Dict[str, Any]:
+        """Build one normalized logical mistake note from its physical fragments."""
+        ordered_members = sorted(
+            members,
+            key=lambda memory: cls._mistake_numeric_value(
+                cls._mistake_metadata(memory).get("chunk_index", 0),
+                0.0,
+            ),
+        )
+        representative = ordered_members[0]
+        metadata = cls._mistake_metadata(representative)
+        defaults = {
+            "failure_count": 1.0,
+            "confidence": 0.5,
+            "frustration_score": 0.0,
+        }
+        for field, default in defaults.items():
+            values = [
+                cls._mistake_numeric_value(
+                    cls._mistake_metadata(member).get(field),
+                    default,
+                )
+                for member in ordered_members
+                if cls._mistake_metadata(member).get(field) is not None
+            ]
+            if values:
+                maximum = max(values)
+                metadata[field] = int(maximum) if field == "failure_count" else maximum
+        metadata["is_avoid_rule"] = any(
+            bool(cls._mistake_metadata(member).get("is_avoid_rule", False))
+            for member in ordered_members
+        )
+        return {
+            "content_hash": representative.content_hash,
+            "logical_hash": key,
+            "chunk_hashes": [member.content_hash for member in ordered_members],
+            "content": cls._join_mistake_chunks(
+                [member.content for member in ordered_members],
+                expected_hash=key,
+            ),
+            "similarity_score": relevance,
+            "metadata": metadata,
+            "updated_at": max(member.updated_at for member in ordered_members),
+            "_members": ordered_members,
+        }
+
+    async def _find_mistake_groups(
+        self,
+        query: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Search mistake notes before top-K filtering and rebuild logical notes.
+
+        The mistake-note tag is applied by the storage backend before its final
+        result limit. If a backend cannot produce semantic candidates (for
+        example a legacy database without embeddings), recent mistake notes are
+        returned as a truthful fallback instead of incorrectly reporting zero.
+        """
+        if limit <= 0:
+            return []
+
+        logical_limit = limit
+        candidate_limit = max(
+            _MISTAKE_SEARCH_CANDIDATE_FLOOR,
+            logical_limit * _MISTAKE_SEARCH_CANDIDATE_MULTIPLIER,
+        )
+        query_results = await self.storage.retrieve(
+            query=query,
+            n_results=candidate_limit,
+            tags=[_MISTAKE_NOTE_TAG],
+        )
+
+        candidates: List[tuple[Memory, float]] = [
+            (result.memory, result.relevance_score)
+            for result in query_results
+            if result.memory.memory_type == "mistake"
+        ]
+
+        all_mistakes: Optional[List[Memory]] = None
+        if not candidates:
+            all_mistakes = await self.storage.get_all_memories(
+                limit=None,
+                memory_type="mistake",
+                tags=[_MISTAKE_NOTE_TAG],
+            )
+            candidates = [(memory, 0.0) for memory in all_mistakes]
+
+        ordered_keys: List[str] = []
+        relevance_by_key: Dict[str, float] = {}
+        candidate_by_key: Dict[str, List[Memory]] = {}
+        for memory, relevance in candidates:
+            key = self._mistake_group_key(memory)
+            if key not in relevance_by_key:
+                ordered_keys.append(key)
+                relevance_by_key[key] = relevance
+                candidate_by_key[key] = []
+            else:
+                relevance_by_key[key] = max(relevance_by_key[key], relevance)
+            candidate_by_key[key].append(memory)
+
+        selected_keys = ordered_keys[:logical_limit]
+        needs_siblings = any(
+            self._mistake_metadata(memory).get("total_chunks", 1) > 1
+            for key in selected_keys
+            for memory in candidate_by_key[key]
+        )
+        if needs_siblings and all_mistakes is None:
+            all_mistakes = await self.storage.get_all_memories(
+                limit=None,
+                memory_type="mistake",
+                tags=[_MISTAKE_NOTE_TAG],
+            )
+
+        siblings_by_key: Dict[str, List[Memory]] = {}
+        if all_mistakes is not None:
+            for memory in all_mistakes:
+                siblings_by_key.setdefault(self._mistake_group_key(memory), []).append(memory)
+
+        groups: List[Dict[str, Any]] = []
+        for key in selected_keys:
+            members = siblings_by_key.get(key, candidate_by_key[key])
+            groups.append(self._build_mistake_group(key, members, relevance_by_key[key]))
+
+        return groups
+
+    async def _find_mistake_group_by_logical_hash(
+        self,
+        logical_hash: str,
+        scan_fragments: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an exact logical note even when semantic retrieval is unavailable."""
+        direct = await self.storage.get_by_hash(logical_hash)
+        if direct and direct.memory_type == "mistake":
+            return self._build_mistake_group(logical_hash, [direct], 1.0)
+        if not scan_fragments:
+            return None
+
+        all_mistakes = await self.storage.get_all_memories(
+            limit=None,
+            memory_type="mistake",
+            tags=[_MISTAKE_NOTE_TAG],
+        )
+        members = [
+            memory
+            for memory in all_mistakes
+            if self._mistake_group_key(memory) == logical_hash
+        ]
+        if not members:
+            return None
+        return self._build_mistake_group(logical_hash, members, 1.0)
+
+    async def _increment_mistake_group(
+        self,
+        group: Dict[str, Any],
+        learning_rate: float,
+        error_weight: float,
+        frustration_threshold: float,
+    ) -> int:
+        """Increment every fragment of a logical mistake note consistently."""
+        metadata = dict(group.get("metadata") or {})
+        count = int(metadata.get("failure_count", 1)) + 1
+        confidence = min(1.0, float(metadata.get("confidence", 0.5)) + learning_rate * error_weight)
+        frustration = float(metadata.get("frustration_score", 0.0)) + 1.0
+
+        updated_members = []
+        for member in group.get("_members", []):
+            member_metadata = self._mistake_metadata(member)
+            member_metadata.update({
+                "failure_count": count,
+                "confidence": confidence,
+                "frustration_score": frustration,
+                "is_avoid_rule": frustration >= frustration_threshold,
+            })
+            updated_members.append(Memory(
+                content=member.content,
+                content_hash=member.content_hash,
+                tags=member.tags,
+                memory_type=member.memory_type,
+                metadata=member_metadata,
+                created_at=member.created_at,
+                created_at_iso=member.created_at_iso,
+                updated_at=member.updated_at,
+                updated_at_iso=member.updated_at_iso,
+            ))
+
+        if len(updated_members) == 1:
+            member = updated_members[0]
+            success, message = await self.storage.update_memory_metadata(
+                content_hash=member.content_hash,
+                updates={"metadata": member.metadata},
+                preserve_timestamps=False,
+            )
+            if not success:
+                raise RuntimeError(
+                    f"Failed to update mistake fragment {member.content_hash}: {message}"
+                )
+        elif updated_members:
+            results = await self.storage.update_memories_batch(
+                updated_members,
+                preserve_timestamps=False,
+            )
+            if len(results) != len(updated_members) or not all(results):
+                raise RuntimeError("Failed to atomically update all mistake fragments")
+        return count
+
     async def mistake_note_add(
         self,
         error_pattern: str,
@@ -1083,38 +1394,54 @@ class MemoryService:
         )
 
         try:
+            from ..utils.hashing import generate_content_hash
+
+            logical_hash = generate_content_hash(content)
+            max_length = self.storage.max_content_length
+            exact_group = await self._find_mistake_group_by_logical_hash(
+                logical_hash,
+                scan_fragments=bool(
+                    ENABLE_AUTO_SPLIT and max_length and len(content) > max_length
+                ),
+            )
+            if exact_group:
+                count = await self._increment_mistake_group(
+                    exact_group,
+                    learning_rate=LEARNING_RATE,
+                    error_weight=ERROR_WEIGHT,
+                    frustration_threshold=FRUSTRATION_THRESHOLD,
+                )
+                return {
+                    "status": "updated",
+                    "content_hash": exact_group["content_hash"],
+                    "logical_hash": exact_group["logical_hash"],
+                    "chunks_updated": len(exact_group["chunk_hashes"]),
+                    "failure_count": count,
+                    "message": f"Existing mistake note updated (seen {count} times)",
+                }
+
             # Check for existing similar mistake note
-            existing = await self.retrieve_memories(
+            existing = await self._find_mistake_groups(
                 query=f"{error_pattern} {context_signature}",
-                n_results=3,
-                memory_type="mistake",
+                limit=3,
             )
 
-            if existing.get("memories"):
-                for mem in existing["memories"]:
+            if existing:
+                for mem in existing:
                     score = mem.get("similarity_score", 0)
                     if score >= MCP_MISTAKE_NOTE_DEDUP_THRESHOLD:
-                        # Increment failure_count on existing note
                         content_hash = mem["content_hash"]
-                        old_meta = mem.get("metadata") or {}
-                        if isinstance(old_meta, str):
-                            old_meta = json.loads(old_meta) if old_meta else {}
-                        count = old_meta.get("failure_count", 1) + 1
-                        old_meta["failure_count"] = count
-
-                        # P4: Update confidence and frustration
-                        old_meta["confidence"] = min(1.0, old_meta.get("confidence", 0.5) + LEARNING_RATE * ERROR_WEIGHT)
-                        old_meta["frustration_score"] = old_meta.get("frustration_score", 0.0) + 1.0
-                        old_meta["is_avoid_rule"] = old_meta["frustration_score"] >= FRUSTRATION_THRESHOLD
-
-                        await self.storage.update_memory_metadata(
-                            content_hash=content_hash,
-                            updates={"metadata": old_meta},
-                            preserve_timestamps=False,
+                        count = await self._increment_mistake_group(
+                            mem,
+                            learning_rate=LEARNING_RATE,
+                            error_weight=ERROR_WEIGHT,
+                            frustration_threshold=FRUSTRATION_THRESHOLD,
                         )
                         return {
                             "status": "updated",
                             "content_hash": content_hash,
+                            "logical_hash": mem["logical_hash"],
+                            "chunks_updated": len(mem["chunk_hashes"]),
                             "failure_count": count,
                             "message": f"Existing mistake note updated (seen {count} times)",
                         }
@@ -1131,6 +1458,8 @@ class MemoryService:
                 tags="mistake-note,error-replay",
                 memory_type="mistake",
                 metadata=initial_meta,
+                skip_semantic_dedup=True,
+                require_all_chunks=True,
             )
 
             if not result.get("success"):
@@ -1142,44 +1471,56 @@ class MemoryService:
                 if match:
                     existing_hash = match.group(1)
                 elif "exact match" in error_msg.lower():
-                    # Compute hash from content for exact match case
-                    from ..utils.hashing import generate_content_hash
                     existing_hash = generate_content_hash(content)
 
                 if existing_hash:
                     existing = await self.storage.get_by_hash(existing_hash)
-                    if existing:
-                        old_meta = existing.metadata or {}
-                        if isinstance(old_meta, str):
-                            old_meta = json.loads(old_meta) if old_meta else {}
-                        count = old_meta.get("failure_count", 1) + 1
-                        old_meta["failure_count"] = count
-                        old_meta["confidence"] = min(1.0, old_meta.get("confidence", 0.5) + LEARNING_RATE * ERROR_WEIGHT)
-                        old_meta["frustration_score"] = old_meta.get("frustration_score", 0.0) + 1.0
-                        old_meta["is_avoid_rule"] = old_meta["frustration_score"] >= FRUSTRATION_THRESHOLD
-                        await self.storage.update_memory_metadata(
-                            content_hash=existing_hash,
-                            updates={"metadata": old_meta},
-                            preserve_timestamps=False,
+                    group_hash = (
+                        self._mistake_group_key(existing)
+                        if existing and existing.memory_type == "mistake"
+                        else existing_hash
+                    )
+                    existing_group = await self._find_mistake_group_by_logical_hash(group_hash)
+                    if existing_group:
+                        count = await self._increment_mistake_group(
+                            existing_group,
+                            learning_rate=LEARNING_RATE,
+                            error_weight=ERROR_WEIGHT,
+                            frustration_threshold=FRUSTRATION_THRESHOLD,
                         )
                         return {
                             "status": "updated",
-                            "content_hash": existing_hash,
+                            "content_hash": existing_group["content_hash"],
+                            "logical_hash": existing_group["logical_hash"],
+                            "chunks_updated": len(existing_group["chunk_hashes"]),
                             "failure_count": count,
                             "message": f"Existing mistake note updated (seen {count} times)",
                         }
                 return {"status": "error", "message": f"Failed to store: {result}"}
 
             content_hash = ""
+            logical_hash = ""
+            chunks_created = 1
             if isinstance(result, dict):
                 mem = result.get("memory", {})
                 if isinstance(mem, dict):
                     content_hash = mem.get("content_hash", "")
-                elif not content_hash:
+                    logical_hash = content_hash
+                if not content_hash:
                     content_hash = result.get("content_hash", "")
+                chunk_memories = result.get("memories", [])
+                if not content_hash and isinstance(chunk_memories, list) and chunk_memories:
+                    first_chunk = chunk_memories[0]
+                    if isinstance(first_chunk, dict):
+                        content_hash = first_chunk.get("content_hash", "")
+                logical_hash = result.get("original_hash", logical_hash or content_hash)
+                if isinstance(chunk_memories, list) and chunk_memories:
+                    chunks_created = len(chunk_memories)
             return {
                 "status": "created",
                 "content_hash": content_hash,
+                "logical_hash": logical_hash,
+                "chunks_created": chunks_created,
                 "failure_count": 1,
                 "message": "New mistake note recorded",
             }
@@ -1203,19 +1544,18 @@ class MemoryService:
             Dictionary with matching mistake notes
         """
         try:
-            result = await self.retrieve_memories(
+            memories = await self._find_mistake_groups(
                 query=query,
-                n_results=limit,
-                memory_type="mistake",
+                limit=limit,
             )
 
             notes = []
-            for mem in result.get("memories", []):
+            for mem in memories:
                 meta = mem.get("metadata") or {}
-                if isinstance(meta, str):
-                    meta = json.loads(meta) if meta else {}
                 notes.append({
                     "content_hash": mem["content_hash"],
+                    "logical_hash": mem["logical_hash"],
+                    "chunk_hashes": mem["chunk_hashes"],
                     "content": mem["content"],
                     "similarity": mem.get("similarity_score", 0),
                     "failure_count": meta.get("failure_count", 1),

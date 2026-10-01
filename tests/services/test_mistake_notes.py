@@ -25,6 +25,9 @@ from unittest.mock import patch
 
 from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 from mcp_memory_service.services.memory_service import MemoryService
+from mcp_memory_service.models.memory import Memory
+from mcp_memory_service.utils.content_splitter import split_content
+from mcp_memory_service.utils.hashing import generate_content_hash
 
 
 @pytest_asyncio.fixture
@@ -150,6 +153,297 @@ async def test_mistake_note_search_empty(memory_service):
     result = await memory_service.mistake_note_search(query="anything", limit=5)
     assert result["count"] == 0
     assert result["notes"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_search_prefilters_before_top_k(memory_service):
+    """A large mixed corpus must not crowd mistake notes out before filtering."""
+    created = await memory_service.mistake_note_add(
+        error_pattern="SCORM retry button hidden after a failed quiz",
+        context_signature="learner player progression gate",
+        incorrect_action="Used the local chapter index as a course-level flag",
+        correct_action="Use the server-provided child-package flag",
+    )
+    assert created["status"] == "created"
+
+    distractor_query = "generic error failure bug exception incorrect action failed command"
+    for index in range(12):
+        stored = await memory_service.store_memory(
+            content=f"{distractor_query} distractor observation {index}",
+            memory_type="observation",
+            conversation_id=f"mistake-search-distractor-{index}",
+        )
+        assert stored["success"] is True
+
+    with patch("mcp_memory_service.storage.mixins.retrieve._MAX_TAG_SEARCH_CANDIDATES", 2):
+        result = await memory_service.mistake_note_search(query=distractor_query, limit=5)
+
+    assert result["count"] == 1
+    assert "SCORM retry button hidden" in result["notes"][0]["content"]
+    assert result["notes"][0]["similarity"] > 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_add_dedup_prefilters_before_top_k(memory_service):
+    """Normal memories must not hide an existing mistake from deduplication."""
+    first = await memory_service.mistake_note_add(
+        error_pattern="Git token expires during push",
+        context_signature="release authentication workflow",
+        incorrect_action="Retried the same rejected credential",
+        correct_action="Refresh the token before retrying",
+    )
+    assert first["status"] == "created"
+
+    dedup_query = "Git token expires during push release authentication workflow"
+    for index in range(12):
+        stored = await memory_service.store_memory(
+            content=f"{dedup_query} distractor observation {index}",
+            memory_type="observation",
+            conversation_id=f"mistake-dedup-distractor-{index}",
+        )
+        assert stored["success"] is True
+
+    original_store = memory_service.store_memory
+
+    async def fail_if_stored(*args, **kwargs):
+        pytest.fail("Deduplication missed the existing mistake and attempted a new store")
+
+    with patch("mcp_memory_service.config.MCP_MISTAKE_NOTE_DEDUP_THRESHOLD", 0.0):
+        memory_service.store_memory = fail_if_stored
+        try:
+            repeated = await memory_service.mistake_note_add(
+                error_pattern="Git token expired while pushing",
+                context_signature="release authentication workflow",
+                incorrect_action="Retried an expired credential",
+                correct_action="Refresh the token before retrying",
+            )
+        finally:
+            memory_service.store_memory = original_store
+
+    assert repeated["status"] == "updated"
+    assert repeated["failure_count"] == 2
+    assert repeated["content_hash"] == first["content_hash"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_chunked_mistake_add_and_search_return_one_complete_note(memory_service, monkeypatch):
+    """Hybrid-sized chunks must remain one actionable logical mistake note."""
+    storage_type = type(memory_service.storage)
+    monkeypatch.setattr(storage_type, "max_content_length", property(lambda self: 140))
+
+    note_fields = {
+        "error_pattern": "A long generated document loses its final verification section " * 3,
+        "context_signature": "Hybrid SQLite and Cloudflare storage with strict content limits " * 3,
+        "incorrect_action": "Stored the structured error as unrelated fragments " * 3,
+        "correct_action": "Reassemble every ordered chunk before returning the mistake note " * 4,
+    }
+    result = await memory_service.mistake_note_add(**note_fields)
+
+    assert result["status"] == "created"
+    assert result["content_hash"]
+    assert result["chunks_created"] > 1
+    assert result["logical_hash"]
+
+    with patch("mcp_memory_service.config.MCP_MISTAKE_NOTE_DEDUP_THRESHOLD", 0.0):
+        repeated = await memory_service.mistake_note_add(
+            error_pattern=note_fields["error_pattern"].replace("loses", "lost"),
+            context_signature=note_fields["context_signature"],
+            incorrect_action=note_fields["incorrect_action"],
+            correct_action=note_fields["correct_action"],
+        )
+    assert repeated["status"] == "updated"
+    assert repeated["chunks_updated"] == result["chunks_created"]
+    assert repeated["failure_count"] == 2
+
+    search = await memory_service.mistake_note_search(
+        query="long generated document final verification section",
+        limit=5,
+    )
+
+    assert search["count"] == 1
+    note = search["notes"][0]
+    expected_content = (
+        f"Pattern: {note_fields['error_pattern']}\n"
+        f"Context: {note_fields['context_signature']}\n"
+        f"Wrong: {note_fields['incorrect_action']}\n"
+        f"Right: {note_fields['correct_action']}"
+    )
+    assert note["logical_hash"] == result["logical_hash"]
+    assert len(note["chunk_hashes"]) == result["chunks_created"]
+    assert note["failure_count"] == 2
+    assert note["content"] == expected_content
+
+    for chunk_hash in note["chunk_hashes"]:
+        chunk = await memory_service.storage.get_by_hash(chunk_hash)
+        assert chunk.metadata["failure_count"] == 2
+
+
+def test_join_mistake_chunks_repairs_legacy_trimmed_boundaries():
+    content = (
+        "Pattern: A legacy mistake note crosses a word boundary several times " * 3
+        + "\nContext: an older boundary-preserving splitter removed separators " * 3
+        + "\nWrong: returned concatenated fields and words " * 3
+        + "\nRight: restore readable separators while rebuilding the logical note " * 3
+    )
+    chunks = split_content(
+        content,
+        max_length=140,
+        preserve_boundaries=True,
+        overlap=50,
+    )
+
+    rebuilt = MemoryService._join_mistake_chunks(
+        chunks,
+        expected_hash=generate_content_hash(content),
+    )
+
+    assert rebuilt == content
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_search_limit_zero_returns_no_notes(memory_service):
+    await memory_service.mistake_note_add(
+        error_pattern="Limit validation",
+        context_signature="mistake search",
+        incorrect_action="Returned an unexpected row",
+        correct_action="Respect a zero result limit",
+    )
+
+    result = await memory_service.mistake_note_search(query="limit validation", limit=0)
+
+    assert result == {"notes": [], "count": 0}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_chunked_mistake_exact_readd_updates_without_semantic_results(memory_service, monkeypatch):
+    storage_type = type(memory_service.storage)
+    monkeypatch.setattr(storage_type, "max_content_length", property(lambda self: 140))
+    note_fields = {
+        "error_pattern": "Exact chunked duplicate " * 12,
+        "context_signature": "semantic backend unavailable " * 8,
+        "incorrect_action": "Stored another logical copy " * 8,
+        "correct_action": "Resolve the group by its original content hash " * 8,
+    }
+    created = await memory_service.mistake_note_add(**note_fields)
+    assert created["status"] == "created"
+    assert created["chunks_created"] > 1
+
+    async def no_semantic_results(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(memory_service.storage, "retrieve", no_semantic_results)
+    repeated = await memory_service.mistake_note_add(**note_fields)
+
+    assert repeated["status"] == "updated"
+    assert repeated["logical_hash"] == created["logical_hash"]
+    assert repeated["chunks_updated"] == created["chunks_created"]
+    assert repeated["failure_count"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_add_rolls_back_partial_chunk_store(memory_service, monkeypatch):
+    storage_type = type(memory_service.storage)
+    monkeypatch.setattr(storage_type, "max_content_length", property(lambda self: 140))
+    original_store = memory_service.storage.store
+    mistake_store_calls = 0
+
+    async def fail_second_mistake_chunk(memory, *args, **kwargs):
+        nonlocal mistake_store_calls
+        if memory.memory_type == "mistake":
+            mistake_store_calls += 1
+            if mistake_store_calls == 2:
+                return False, "injected second-chunk failure"
+        return await original_store(memory, *args, **kwargs)
+
+    monkeypatch.setattr(memory_service.storage, "store", fail_second_mistake_chunk)
+    result = await memory_service.mistake_note_add(
+        error_pattern="Partial chunk storage " * 12,
+        context_signature="transient backend failure " * 8,
+        incorrect_action="Accepted incomplete content " * 8,
+        correct_action="Rollback every newly stored fragment " * 8,
+    )
+
+    assert result["status"] == "error"
+    assert "injected second-chunk failure" in result["message"]
+    remaining = await memory_service.storage.get_all_memories(
+        limit=None,
+        memory_type="mistake",
+        tags=["mistake-note"],
+    )
+    assert remaining == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_search_normalizes_legacy_numeric_metadata(memory_service, monkeypatch):
+    storage_type = type(memory_service.storage)
+    monkeypatch.setattr(storage_type, "max_content_length", property(lambda self: 140))
+    created = await memory_service.mistake_note_add(
+        error_pattern="Legacy metadata conversion " * 10,
+        context_signature="mixed numeric encodings " * 8,
+        incorrect_action="Compared strings and floats " * 8,
+        correct_action="Normalize numeric counters before grouping " * 8,
+    )
+    assert created["chunks_created"] > 1
+
+    stored = await memory_service.mistake_note_search(query="legacy metadata conversion", limit=1)
+    hashes = stored["notes"][0]["chunk_hashes"]
+    first = await memory_service.storage.get_by_hash(hashes[0])
+    second = await memory_service.storage.get_by_hash(hashes[1])
+    first_meta = dict(first.metadata)
+    second_meta = dict(second.metadata)
+    first_meta["confidence"] = "0.9"
+    second_meta["confidence"] = 0.5
+    await memory_service.storage.update_memory_metadata(hashes[0], {"metadata": first_meta})
+    await memory_service.storage.update_memory_metadata(hashes[1], {"metadata": second_meta})
+
+    result = await memory_service.mistake_note_search(query="legacy metadata conversion", limit=1)
+
+    assert "error" not in result
+    assert result["count"] == 1
+    assert result["notes"][0]["metadata"]["confidence"] == pytest.approx(0.9)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sqlite_batch_metadata_update_rolls_back_on_missing_fragment(memory_service):
+    created = await memory_service.mistake_note_add(
+        error_pattern="Atomic metadata update",
+        context_signature="fragment group",
+        incorrect_action="Committed only the first update",
+        correct_action="Rollback the complete batch on failure",
+    )
+    content_hash = created["content_hash"]
+    before = await memory_service.storage.get_by_hash(content_hash)
+
+    results = await memory_service.storage.update_memories_batch(
+        [
+            Memory(
+                content=before.content,
+                content_hash=content_hash,
+                tags=before.tags,
+                memory_type=before.memory_type,
+                metadata={"failure_count": 9},
+            ),
+            Memory(
+                content="missing",
+                content_hash="missing-fragment",
+                memory_type="mistake",
+                metadata={"failure_count": 9},
+            ),
+        ],
+        preserve_timestamps=False,
+    )
+
+    after = await memory_service.storage.get_by_hash(content_hash)
+    assert results == [False, False]
+    assert after.metadata["failure_count"] == before.metadata["failure_count"]
 
 
 @pytest.mark.unit
