@@ -8,11 +8,11 @@
     automatically restarts if it crashes between logins.
 
 .PARAMETER IntervalMinutes
-    How often to check (default: 5 minutes).
+    How often to check (default: 1 minute).
 
 .EXAMPLE
     .\add_watchdog_trigger.ps1
-    Adds a 5-minute watchdog trigger.
+    Adds a 1-minute watchdog trigger.
 
 .EXAMPLE
     .\add_watchdog_trigger.ps1 -IntervalMinutes 10
@@ -20,7 +20,8 @@
 #>
 
 param(
-    [int]$IntervalMinutes = 5
+    [ValidateRange(1, 1440)]
+    [int]$IntervalMinutes = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,21 +46,28 @@ $Task.Triggers | ForEach-Object {
 
 # Create new repeating trigger
 Write-Host ""
-Write-Host "[INFO] Adding repeating trigger (every $IntervalMinutes minutes)..." -ForegroundColor Yellow
+Write-Host "[INFO] Replacing repeating watchdog trigger (every $IntervalMinutes minutes)..." -ForegroundColor Yellow
 
 # Note: RepetitionDuration must be finite but long (9999 days = ~27 years)
 $RepetitionTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
     -RepetitionDuration (New-TimeSpan -Days 9999)
 
-# Get existing triggers and add new one
-$ExistingTriggers = @($Task.Triggers)
-$AllTriggers = $ExistingTriggers + @($RepetitionTrigger)
+# Preserve logon and custom one-shot triggers, but replace any previous
+# repeating time trigger so running this script twice cannot create duplicates.
+$PreservedTriggers = @($Task.Triggers | Where-Object {
+    -not (
+        $_.CimClass.CimClassName -eq "MSFT_TaskTimeTrigger" -and
+        $_.Repetition -and
+        $_.Repetition.Interval
+    )
+})
+$AllTriggers = $PreservedTriggers + @($RepetitionTrigger)
 
 # Update task
 Set-ScheduledTask -TaskName $TaskName -Trigger $AllTriggers | Out-Null
 
-Write-Host "[SUCCESS] Watchdog trigger added!" -ForegroundColor Green
+Write-Host "[SUCCESS] Watchdog trigger configured!" -ForegroundColor Green
 Write-Host ""
 Write-Host "Configuration:" -ForegroundColor Cyan
 Write-Host "  - Check interval: Every $IntervalMinutes minutes"

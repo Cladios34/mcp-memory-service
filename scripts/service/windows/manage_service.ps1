@@ -95,7 +95,9 @@ function Get-ServerStatus {
         $StoredPid = Get-Content $PidFile -ErrorAction SilentlyContinue
         if ($StoredPid) {
             $Process = Get-Process -Id $StoredPid -ErrorAction SilentlyContinue
-            if ($Process -and $Process.ProcessName -like "*python*") {
+            # The wrapper records the launcher PID. With the preferred `uv run`
+            # path this is uv.exe, while the child listener is python.exe.
+            if ($Process -and ($Process.ProcessName -like "*python*" -or $Process.ProcessName -eq "uv")) {
                 $ProcessRunning = $true
                 $ProcessPid = $StoredPid
             }

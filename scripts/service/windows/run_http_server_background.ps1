@@ -20,6 +20,7 @@ $ProjectRoot = (Get-Item "$ScriptDir\..\..\..").FullName
 
 # Load shared server-config helper (reads host/port/https from .env)
 . "$ScriptDir\lib\server-config.ps1"
+. "$ScriptDir\lib\watchdog-policy.ps1"
 $ServerConfig = Get-McpServerConfig -ProjectRoot $ProjectRoot
 Enable-McpSelfSignedCertBypass
 $McpWebExtras = Get-McpWebRequestExtraParams -HttpsEnabled $ServerConfig.HttpsEnabled
@@ -36,6 +37,9 @@ $PythonLogFile = Join-Path $LogDir "http-server-python.log"
 $PidFile = Join-Path $env:LOCALAPPDATA "mcp-memory\http-server.pid"
 $MaxRestarts = 3
 $RestartDelaySeconds = 60
+$StartupTimeoutSeconds = 300
+$HealthCheckIntervalSeconds = 30
+$MaxConsecutiveHealthFailures = 3
 
 # Ensure log directory exists
 if (-not (Test-Path $LogDir)) {
@@ -139,6 +143,39 @@ function Get-ServerProcesses {
     }
 }
 
+# Best-effort log consolidation. Descendant Python processes can briefly keep
+# redirected handles open after uv.exe exits; diagnostics must never consume a
+# restart attempt merely because the log is still locked.
+function Merge-PythonErrorLog {
+    param(
+        [Parameter(Mandatory = $true)] [string] $StandardOutputPath,
+        [Parameter(Mandatory = $true)] [string] $StandardErrorPath
+    )
+
+    if (-not (Test-Path $StandardErrorPath)) { return }
+
+    for ($Attempt = 1; $Attempt -le 10; $Attempt++) {
+        try {
+            if ((Get-Item $StandardErrorPath).Length -eq 0) {
+                Remove-Item $StandardErrorPath -Force -ErrorAction SilentlyContinue
+                return
+            }
+
+            Add-Content -Path $StandardOutputPath -Value ""
+            Add-Content -Path $StandardOutputPath -Value "===== STDERR ====="
+            Get-Content $StandardErrorPath | Add-Content -Path $StandardOutputPath
+            Remove-Item $StandardErrorPath -Force -ErrorAction SilentlyContinue
+            return
+        } catch {
+            if ($Attempt -lt 10) {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+
+    Write-Log "Could not merge stderr because a process still holds a log handle; preserved at $StandardErrorPath" "WARN"
+}
+
 # Check if server is already running.
 # DECISION(2026-06-09): HTTP health is the ONLY proof of life. The previous
 # implementation trusted the PID file first ($Process.ProcessName -like
@@ -169,17 +206,19 @@ function Test-ServerRunning {
         $Youngest = $ServerProcs | Sort-Object CreationDate -Descending | Select-Object -First 1
         $AgeSeconds = [int]((Get-Date) - $Youngest.CreationDate).TotalSeconds
 
-        # Cold start takes ~30-60s (ONNX model load). Leave a starting server alone.
-        if ($AgeSeconds -lt 120) {
+        # Hybrid cold starts can include ONNX, remote storage and scheduler
+        # initialization. Do not classify a never-ready process as a zombie.
+        if ($AgeSeconds -lt $StartupTimeoutSeconds) {
             Write-Log "Server process PID $($Youngest.ProcessId) started ${AgeSeconds}s ago - cold start in progress, not restarting."
             return $true
         }
 
-        # Process alive > 120s but HTTP dead = zombie (seen 2026-06-09: port
-        # closed while the process survived, likely after sleep/resume).
+        # A process that never became reachable within the bounded startup
+        # window is safe to recycle. Runtime zombies are detected faster by the
+        # readiness-aware loop below.
         # Kill the whole tree so the restart below binds the port cleanly.
         foreach ($Proc in $ServerProcs) {
-            Write-Log "Killing zombie server process tree PID $($Proc.ProcessId) (alive ${AgeSeconds}s, HTTP dead)" "WARN"
+            Write-Log "Killing unready server process tree PID $($Proc.ProcessId) (alive ${AgeSeconds}s, HTTP dead)" "WARN"
             taskkill /PID $Proc.ProcessId /T /F 2>$null | Out-Null
         }
         Start-Sleep -Seconds 2
@@ -293,8 +332,9 @@ while ($RestartCount -lt $MaxRestarts) {
             Write-Log "Python log locked by another process; using $PythonLogFile for this attempt" "WARN"
         }
 
-        # Separate file for stderr — Start-Process can't merge streams
-        $PythonErrFile = "$PythonLogFile.err"
+        # Start-Process cannot merge streams. Use an immutable per-attempt
+        # stderr path so a slow-closing child can never block the next launch.
+        $PythonErrFile = Join-Path $LogDir ("http-server-python.stderr.{0}.attempt{1}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ($RestartCount + 1))
 
         # Start-Process is the PowerShell-idiomatic way to redirect output to a
         # file. It avoids the .NET event handler runspace bug where
@@ -318,13 +358,11 @@ while ($RestartCount -lt $MaxRestarts) {
         # never noticed, the wrapper held the single-instance mutex forever and
         # the dead server was never restarted.
         $ConsecutiveHealthFailures = 0
+        $ReadinessObserved = $false
         while (-not $Process.HasExited) {
-            if ($Process.WaitForExit(30000)) { break }
+            if ($Process.WaitForExit($HealthCheckIntervalSeconds * 1000)) { break }
 
-            # Grace period for cold start (ONNX model load ~30-60s)
             $UptimeSeconds = [int]((Get-Date) - $Process.StartTime).TotalSeconds
-            if ($UptimeSeconds -lt 120) { continue }
-
             $Healthy = $false
             try {
                 $healthParams = @{
@@ -338,13 +376,36 @@ while ($RestartCount -lt $MaxRestarts) {
                 # HTTP dead while process alive
             }
 
-            if ($Healthy) {
-                $ConsecutiveHealthFailures = 0
-            } else {
-                $ConsecutiveHealthFailures++
-                Write-Log "Health check failed ($ConsecutiveHealthFailures/3) while server PID $($Process.Id) is alive" "WARN"
-                if ($ConsecutiveHealthFailures -ge 3) {
-                    Write-Log "Zombie server detected (process alive, HTTP dead ~90s). Killing process tree to restart." "ERROR"
+            $Decision = Get-McpWatchdogDecision `
+                -Healthy $Healthy `
+                -ReadinessObserved $ReadinessObserved `
+                -UptimeSeconds $UptimeSeconds `
+                -ConsecutiveFailures $ConsecutiveHealthFailures `
+                -StartupTimeoutSeconds $StartupTimeoutSeconds `
+                -MaxConsecutiveFailures $MaxConsecutiveHealthFailures
+
+            $WasReady = $ReadinessObserved
+            $ReadinessObserved = $Decision.ReadinessObserved
+            $ConsecutiveHealthFailures = $Decision.ConsecutiveFailures
+
+            switch ($Decision.Action) {
+                "Healthy" {
+                    if (-not $WasReady) {
+                        Write-Log "Server readiness confirmed after ${UptimeSeconds}s."
+                    }
+                }
+                "WaitForReadiness" {
+                    Write-Log "Waiting for server readiness (${UptimeSeconds}s/$($StartupTimeoutSeconds)s)."
+                }
+                "WaitForHealthRecovery" {
+                    Write-Log "Health check failed ($ConsecutiveHealthFailures/$MaxConsecutiveHealthFailures) after readiness while server PID $($Process.Id) is alive" "WARN"
+                }
+                "RestartStartupTimeout" {
+                    Write-Log "Server did not become ready within $StartupTimeoutSeconds seconds. Killing process tree to restart." "ERROR"
+                    taskkill /PID $Process.Id /T /F 2>$null | Out-Null
+                }
+                "RestartUnhealthy" {
+                    Write-Log "Server became unhealthy after readiness ($ConsecutiveHealthFailures consecutive failures). Killing process tree to restart." "ERROR"
                     taskkill /PID $Process.Id /T /F 2>$null | Out-Null
                 }
             }
@@ -354,14 +415,7 @@ while ($RestartCount -lt $MaxRestarts) {
         $Process.WaitForExit()
         $ExitCode = $Process.ExitCode
 
-        # If stderr file has content, append it to the python log with a marker
-        # so errors surface in a single place.
-        if ((Test-Path $PythonErrFile) -and (Get-Item $PythonErrFile).Length -gt 0) {
-            Add-Content -Path $PythonLogFile -Value ""
-            Add-Content -Path $PythonLogFile -Value "===== STDERR ====="
-            Get-Content $PythonErrFile | Add-Content -Path $PythonLogFile
-            Remove-Item $PythonErrFile -Force -ErrorAction SilentlyContinue
-        }
+        Merge-PythonErrorLog -StandardOutputPath $PythonLogFile -StandardErrorPath $PythonErrFile
 
         Write-Log "Server exited with code $ExitCode" $(if ($ExitCode -eq 0) { "INFO" } else { "ERROR" })
 
@@ -390,6 +444,7 @@ while ($RestartCount -lt $MaxRestarts) {
 
 if ($RestartCount -ge $MaxRestarts) {
     Write-Log "Max restart attempts ($MaxRestarts) reached. Giving up." "ERROR"
+    exit 1
 }
 
 Write-Log "========== MCP Memory HTTP Server Stopped =========="
