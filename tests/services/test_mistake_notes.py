@@ -669,3 +669,33 @@ async def test_mistake_note_delete_wrong_type(memory_service):
     result = await memory_service.mistake_note_delete(content_hash=content_hash)
     assert result["status"] == "error"
     assert "not a mistake note" in result["message"].lower()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_search_returns_only_lesson_metadata(memory_service):
+    """Search results keep the learning signals but not access tracking (2026-11-04)."""
+    created = await memory_service.mistake_note_add(
+        error_pattern="Slim search payload regression",
+        context_signature="mistake_note_search output",
+        incorrect_action="Returned the full stored metadata",
+        correct_action="Return only the lesson fields",
+    )
+    assert created["status"] == "created"
+
+    # Two searches so access tracking has written access_queries / access_count.
+    await memory_service.mistake_note_search(query="slim search payload regression", limit=1)
+    result = await memory_service.mistake_note_search(query="slim search payload regression", limit=1)
+
+    note = result["notes"][0]
+    assert set(note["metadata"]) <= {
+        "failure_count", "confidence", "frustration_score", "is_avoid_rule", "total_chunks",
+    }
+    assert note["metadata"]["failure_count"] == 1
+    assert note["metadata"]["confidence"] == pytest.approx(0.5)
+    assert "access_queries" not in note["metadata"]
+    assert note["content"].startswith("Pattern: Slim search payload regression")
+
+    # Storage still holds the access tracking: only the returned payload is trimmed.
+    stored = await memory_service.storage.get_by_hash(note["content_hash"])
+    assert stored.metadata.get("access_count", 0) >= 1

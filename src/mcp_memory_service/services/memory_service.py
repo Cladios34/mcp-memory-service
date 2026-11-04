@@ -282,6 +282,18 @@ class HealthCheckFailure(TypedDict):
     error: str
 
 
+# Metadata fields returned by mistake_note_search: the learning signals of a note.
+# Access tracking (access_queries, access_count, last_accessed_at) and ranking internals
+# (relevance_score, decay_factor, quality_*) stay in storage but are not returned.
+_MISTAKE_SEARCH_METADATA_KEYS = (
+    "failure_count",
+    "confidence",
+    "frustration_score",
+    "is_avoid_rule",
+    "total_chunks",
+)
+
+
 class MemoryService:
     """
     Shared service for memory operations with consistent business logic.
@@ -1643,7 +1655,11 @@ class MemoryService:
                     "content": mem["content"],
                     "similarity": mem.get("similarity_score", 0),
                     "failure_count": meta.get("failure_count", 1),
-                    "metadata": meta,
+                    # WHY(2026-11-04): the full metadata carried access tracking (the last 10
+                    # queries that hit the note, access counters) and ranking internals. The
+                    # caller is an LLM that reads every byte, and that block was often longer
+                    # than the lesson itself. Keep only the fields that describe the lesson.
+                    "metadata": {k: meta[k] for k in _MISTAKE_SEARCH_METADATA_KEYS if k in meta},
                     "updated_at": mem.get("updated_at"),
                 })
 

@@ -17,6 +17,17 @@ from mcp import types
 logger = logging.getLogger(__name__)
 
 
+def _to_text(result: dict) -> List[types.TextContent]:
+    """Serialize a handler result for the model that reads it.
+
+    WHY(2026-11-04): ensure_ascii=False keeps accented letters as themselves instead of
+    six-character \\uXXXX escapes, and compact separators drop the indentation. Measured on
+    five real searches: about 11 % fewer characters for the same content.
+    """
+    return [types.TextContent(type="text", text=json.dumps(
+        result, default=str, ensure_ascii=False, separators=(",", ":")))]
+
+
 async def handle_mistake_note_add(server, arguments: dict) -> List[types.TextContent]:
     """Record a mistake pattern for error replay."""
     await server._ensure_storage_initialized()
@@ -26,7 +37,7 @@ async def handle_mistake_note_add(server, arguments: dict) -> List[types.TextCon
         incorrect_action=arguments.get("incorrect_action", ""),
         correct_action=arguments.get("correct_action", ""),
     )
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    return _to_text(result)
 
 
 async def handle_mistake_note_search(server, arguments: dict) -> List[types.TextContent]:
@@ -36,7 +47,7 @@ async def handle_mistake_note_search(server, arguments: dict) -> List[types.Text
         query=arguments.get("query", ""),
         limit=arguments.get("limit", 5),
     )
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    return _to_text(result)
 
 
 async def handle_mistake_note_update(server, arguments: dict) -> List[types.TextContent]:
@@ -50,7 +61,7 @@ async def handle_mistake_note_update(server, arguments: dict) -> List[types.Text
         incorrect_action=arguments.get("incorrect_action"),
         correct_action=arguments.get("correct_action"),
     )
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    return _to_text(result)
 
 
 async def handle_mistake_note_delete(server, arguments: dict) -> List[types.TextContent]:
@@ -59,4 +70,4 @@ async def handle_mistake_note_delete(server, arguments: dict) -> List[types.Text
     result = await server.memory_service.mistake_note_delete(
         content_hash=arguments.get("content_hash", ""),
     )
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    return _to_text(result)
