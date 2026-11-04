@@ -152,6 +152,7 @@ def _tiny_tokenizer(truncation=None):
 @pytest.mark.parametrize("model_type,max_pos,expected", [
     ("bert", 512, 512),            # intfloat/multilingual-e5-small
     ("xlm-roberta", 514, 512),     # multilingual-e5-base: 2 slots reserved
+    ("mpnet", 514, 512),           # MPNet has the same padding offset
 ])
 def test_max_input_tokens_reads_model_config(monkeypatch, tmp_path, model_type, max_pos, expected):
     """The safeguard limit comes from the model's own config.json (2026-11-04)."""
@@ -165,6 +166,15 @@ def test_max_input_tokens_reads_model_config(monkeypatch, tmp_path, model_type, 
 def test_max_input_tokens_defaults_without_config(monkeypatch, tmp_path):
     m = _make_without_io(monkeypatch, "multilingual-e5-small")
     m._model_dir = tmp_path  # no config.json
+    assert m._max_input_tokens() == 512
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", '{"max_position_embeddings": 1e999}', "not json"])
+def test_max_input_tokens_survives_malformed_config(monkeypatch, tmp_path, raw):
+    """A malformed config.json must fall back to 512, never break model loading."""
+    m = _make_without_io(monkeypatch, "multilingual-e5-small")
+    m._model_dir = tmp_path
+    (tmp_path / "config.json").write_text(raw)
     assert m._max_input_tokens() == 512
 
 

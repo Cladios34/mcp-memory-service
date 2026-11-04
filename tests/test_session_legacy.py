@@ -105,3 +105,31 @@ class TestSessionLegacy:
         tools = await server.handle_list_tools()
         tool_names = [t.name for t in tools]
         assert "commit_session_legacy" in tool_names
+
+
+class TestSessionLegacyMistakeNoteContract:
+    """2026-11-04: mistake_note_add refuses blank key fields; session_end must adapt."""
+
+    @pytest.mark.asyncio
+    async def test_error_without_tool_is_stored_with_fallback_context(self):
+        server = MemoryServer()
+        result = await server.handle_call_tool("commit_session_legacy", {
+            "session_id": "sess-test-notool", "agent_id": "kiro",
+            "task_summary": "Tool-less error", "outcome": "partial",
+            "errors": [{"error": "Unique tool-less failure 7f3a", "resolution": "Retry with backoff"}],
+        })
+        data = json.loads(result[0].text)
+        assert data["mistake_notes_updated"] == 1
+        found = await server.memory_service.mistake_note_search(query="Unique tool-less failure 7f3a", limit=3)
+        assert any("sess-test-notool (tool not recorded)" in n["content"] for n in found["notes"])
+
+    @pytest.mark.asyncio
+    async def test_rejected_note_is_not_counted(self):
+        server = MemoryServer()
+        result = await server.handle_call_tool("commit_session_legacy", {
+            "session_id": "sess-test-blank", "agent_id": "kiro",
+            "task_summary": "Blank error", "outcome": "partial",
+            "errors": [{"tool": "shell", "error": "", "resolution": "Something"}],
+        })
+        data = json.loads(result[0].text)
+        assert data["mistake_notes_updated"] == 0

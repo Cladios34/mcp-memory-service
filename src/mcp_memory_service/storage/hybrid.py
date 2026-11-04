@@ -1086,6 +1086,38 @@ class BackgroundSyncService:
             return current_memory
         return memory
 
+    async def _current_secondary_updates(self, operation: SyncOperation) -> Optional[Dict[str, Any]]:
+        """Rebuild an update for a REPLACING secondary from the primary's current state.
+
+        GOTCHA(2026-11-04): CloudflareStorage.update_memory_metadata replaces metadata_json
+        with what it receives. Forwarding a caller's delta (a quality score, three chunk
+        fields...) erased every other key in D1, and a device later filled from D1 inherited
+        the stripped copy: on a new Mac, 8 214 of 11 907 memories had lost source_file /
+        chunk_index / failure_count..., while the older VPS (whose drift pulls MERGE) still
+        had them. So send the full current metadata, read HERE at send time, not at enqueue:
+        a retried or reordered operation then ships today's state instead of overwriting a
+        newer one with an old snapshot (same rule as _get_current_queued_store_memory).
+        A missing row is skipped only if it is really gone; an unreadable live row raises so
+        the retry path runs. Never fall back to the delta. Per-device access tracking stays
+        local (it is never read from the secondary) and keeps the payload small.
+        Returns None when the row is no longer live.
+        """
+        memory = await self.primary.get_by_hash(operation.content_hash)
+        if memory is None:
+            state = await self.primary.get_sync_state_for_hash(operation.content_hash)
+            if state is None or state[1] is not None:
+                logger.debug("Skipping queued update for %s: primary row is no longer live",
+                             _sanitize_log_value(operation.content_hash[:16]))
+                return None
+            raise RuntimeError(
+                f"Could not read the primary row for queued update {operation.content_hash[:16]}"
+            )
+        top_level = {k: v for k, v in operation.updates.items() if k in _SECONDARY_TOP_LEVEL_UPDATE_KEYS}
+        top_level["metadata"] = {
+            k: v for k, v in (memory.metadata or {}).items() if k not in _LOCAL_ONLY_METADATA_KEYS
+        }
+        return top_level
+
     async def _process_single_operation(self, operation: SyncOperation):
         """Process a single sync operation to secondary storage."""
         try:
@@ -1120,21 +1152,21 @@ class BackgroundSyncService:
                     raise Exception(f"Delete operation failed: {message}")
 
             elif operation.operation == 'update' and operation.content_hash and operation.updates:
-                # Validate metadata size before syncing to Cloudflare (only for backends that require it)
                 if getattr(self.secondary, 'requires_metadata_normalization', False):
-                    if 'metadata' in operation.updates:
+                    updates_to_send = await self._current_secondary_updates(operation)
+                    if updates_to_send is None:
+                        return  # primary row no longer live: the delete op carries it
+                    normalized_updates = _normalize_metadata_for_cloudflare(updates_to_send)
+                    # Validate the size of what is really sent (after CSV compression).
+                    if 'metadata' in normalized_updates:
                         import json
-                        metadata_json = json.dumps(operation.updates['metadata'])
-                        metadata_size_kb = len(metadata_json.encode('utf-8')) / 1024
-
+                        metadata_size_kb = len(json.dumps(normalized_updates['metadata']).encode('utf-8')) / 1024
                         if metadata_size_kb > 9.5:  # 9.5KB safety margin (Cloudflare limit is 10KB)
-                            logger.warning("Skipping Cloudflare sync for %s: metadata too large (%.2fKB > 9.5KB limit)", _sanitize_log_value(operation.content_hash[:16]), metadata_size_kb)
+                            logger.warning("Cloudflare sync for %s: metadata too large (%.2fKB > 9.5KB limit), sending tags/type only", _sanitize_log_value(operation.content_hash[:16]), metadata_size_kb)
                             self.sync_stats['operations_failed'] += 1
-                            return  # Skip this update permanently (too large for Cloudflare)
-
-                # Normalize metadata for Cloudflare backend (only for backends that require it)
-                if getattr(self.secondary, 'requires_metadata_normalization', False):
-                    normalized_updates = _normalize_metadata_for_cloudflare(operation.updates)
+                            normalized_updates = {k: v for k, v in normalized_updates.items() if k != 'metadata'}
+                            if not normalized_updates:
+                                return  # nothing else to send; D1 keeps its previous metadata
                 else:
                     normalized_updates = operation.updates
 
@@ -2404,36 +2436,12 @@ class HybridMemoryStorage(MemoryStorage):
             operation = SyncOperation(
                 operation='update',
                 content_hash=content_hash,
-                updates=await self._secondary_metadata_updates(content_hash, updates),
+                updates=updates,
                 preserve_timestamps=preserve_timestamps
             )
             await self.sync_service.enqueue_operation(operation)
 
         return success, message
-
-    async def _secondary_metadata_updates(self, content_hash: str, updates: Dict[str, Any]) -> Dict[str, Any]:
-        """Build the update sent to the secondary: the memory's FULL metadata, not the delta.
-
-        GOTCHA(2026-11-04): CloudflareStorage.update_memory_metadata REPLACES metadata_json
-        with what it receives. Forwarding the caller's partial `updates` (a quality score,
-        three chunk fields...) erased every other key in D1. A device that later filled
-        itself from D1 inherited the stripped copy: measured on a new Mac, 8 214 of 11 907
-        memories had lost source_file / chunk_index / failure_count... while the older VPS,
-        whose drift pulls MERGE locally, still had them. The primary has already merged the
-        delta, so read it back and send the whole metadata. Access tracking stays local
-        (it is never synced by the read path either) and keeps the payload small.
-        Secondaries that do not need Cloudflare normalization keep the previous behaviour.
-        """
-        if not getattr(self.secondary, 'requires_metadata_normalization', False):
-            return updates
-        memory = await self.primary.get_by_hash(content_hash)
-        if memory is None:
-            return updates
-        top_level = {k: v for k, v in updates.items() if k in _SECONDARY_TOP_LEVEL_UPDATE_KEYS}
-        top_level["metadata"] = {
-            k: v for k, v in (memory.metadata or {}).items() if k not in _LOCAL_ONLY_METADATA_KEYS
-        }
-        return top_level
 
     async def mark_superseded_batch(self, pairs: list[tuple[str, str]]) -> int:
         """Mark memories as superseded in primary storage.

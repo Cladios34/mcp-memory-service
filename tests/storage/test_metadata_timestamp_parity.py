@@ -533,3 +533,96 @@ async def test_hybrid_single_update_keeps_full_metadata_in_cloudflare(metadata_s
         assert "access_count" not in stored and "access_queries" not in stored
     finally:
         await hybrid.primary.close()
+
+
+async def _hybrid_on(metadata_storage, temp_db_path, name, extra_metadata=None):
+    secondary, secondary_db, content_hash, metadata_column = metadata_storage
+    if metadata_column != "metadata_json":
+        pytest.skip("Cloudflare-only behaviour")
+    hybrid = HybridMemoryStorage(f"{temp_db_path}/{name}.db")
+    await hybrid.primary.initialize()
+    hybrid.secondary = secondary
+    hybrid.sync_service = BackgroundSyncService(hybrid.primary, secondary)
+    memory = await secondary.get_by_hash(content_hash)
+    memory.metadata.update(extra_metadata or {})
+    success, message = await hybrid.primary.store(memory)
+    assert success, message
+    return hybrid, secondary, secondary_db, content_hash
+
+
+def _d1_metadata(secondary_db, content_hash):
+    return decompress_metadata_from_sync(json.loads(secondary_db.execute(
+        "SELECT metadata_json FROM memories WHERE content_hash = ?", (content_hash,)
+    ).fetchone()[0]))
+
+
+@pytest.mark.asyncio
+async def test_retried_old_update_does_not_overwrite_newer_state(metadata_storage, temp_db_path):
+    """Full metadata is read at SEND time: an operation replayed after a newer one ships
+    today's state, not the snapshot of its enqueue time (review finding, 2026-11-04)."""
+    hybrid, secondary, secondary_db, content_hash = await _hybrid_on(metadata_storage, temp_db_path, "retry")
+    try:
+        await hybrid.update_memory_metadata(content_hash, {"metadata": {"step": "A"}})
+        op_a = hybrid.sync_service.operation_queue.get_nowait()
+        await hybrid.update_memory_metadata(content_hash, {"metadata": {"step": "B", "extra": 1}})
+        op_b = hybrid.sync_service.operation_queue.get_nowait()
+        await hybrid.sync_service._process_single_operation(op_b)
+        await hybrid.sync_service._process_single_operation(op_a)  # replayed late
+        stored = _d1_metadata(secondary_db, content_hash)
+        assert stored["step"] == "B" and stored["extra"] == 1 and stored["source"] == "original"
+    finally:
+        await hybrid.primary.close()
+
+
+@pytest.mark.asyncio
+async def test_update_for_deleted_row_is_skipped(metadata_storage, temp_db_path):
+    hybrid, secondary, secondary_db, content_hash = await _hybrid_on(metadata_storage, temp_db_path, "deleted")
+    try:
+        await hybrid.update_memory_metadata(content_hash, {"metadata": {"x": 1}})
+        op = hybrid.sync_service.operation_queue.get_nowait()
+        await hybrid.primary.delete(content_hash)
+        assert await hybrid.sync_service._current_secondary_updates(op) is None
+        before = secondary_db.execute("SELECT metadata_json FROM memories WHERE content_hash = ?", (content_hash,)).fetchone()[0]
+        await hybrid.sync_service._process_single_operation(op)
+        after = secondary_db.execute("SELECT metadata_json FROM memories WHERE content_hash = ?", (content_hash,)).fetchone()[0]
+        assert after == before  # nothing sent, and above all no delta replacing D1
+    finally:
+        await hybrid.primary.close()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_live_row_raises_instead_of_sending_delta(metadata_storage, temp_db_path, monkeypatch):
+    """get_by_hash returns None on read errors: never fall back to the delta."""
+    hybrid, secondary, secondary_db, content_hash = await _hybrid_on(metadata_storage, temp_db_path, "unreadable")
+    try:
+        await hybrid.update_memory_metadata(content_hash, {"metadata": {"x": 1}})
+        op = hybrid.sync_service.operation_queue.get_nowait()
+
+        async def broken_read(*args, **kwargs):
+            return None
+        monkeypatch.setattr(hybrid.primary, "get_by_hash", broken_read)
+        with pytest.raises(RuntimeError, match="Could not read the primary row"):
+            await hybrid.sync_service._current_secondary_updates(op)
+    finally:
+        await hybrid.primary.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_metadata_still_ships_tags(metadata_storage, temp_db_path, monkeypatch):
+    """Over 9.5 KB AFTER compression: metadata is held back, tags/type still go out."""
+    hybrid, secondary, secondary_db, content_hash = await _hybrid_on(
+        metadata_storage, temp_db_path, "oversize", {"blob": "x" * 12000})
+    try:
+        await hybrid.update_memory_metadata(content_hash, {"tags": ["new-tag"], "metadata": {"y": 2}})
+        op = hybrid.sync_service.operation_queue.get_nowait()
+        sent = []
+        real = secondary.update_memory_metadata
+
+        async def spy(h, updates, preserve_timestamps=True):
+            sent.append(updates)
+            return await real(h, updates, preserve_timestamps=preserve_timestamps)
+        monkeypatch.setattr(secondary, "update_memory_metadata", spy)
+        await hybrid.sync_service._process_single_operation(op)
+        assert sent and "metadata" not in sent[0] and sent[0]["tags"] == ["new-tag"]
+    finally:
+        await hybrid.primary.close()

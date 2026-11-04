@@ -2450,13 +2450,17 @@ class MemoryServer:
 
             # Process errors → mistake_note_add
             for err in arguments.get("errors", []):
-                await self.memory_service.mistake_note_add(
+                # WHY(2026-11-04): mistake_note_add now refuses a blank error_pattern or
+                # context_signature; give the tool-less case an honest context and count
+                # only the notes really stored (the result used to be ignored).
+                note = await self.memory_service.mistake_note_add(
                     error_pattern=err.get("error", ""),
-                    context_signature=err.get("tool", ""),
+                    context_signature=err.get("tool") or f"session {session_id or 'unknown'} (tool not recorded)",
                     incorrect_action=err.get("error", ""),
                     correct_action=err.get("resolution", ""),
                 )
-                mistake_notes_updated += 1
+                if note.get("status") != "error":
+                    mistake_notes_updated += 1
 
             # Process user_corrections → separate observations
             for corr in arguments.get("user_corrections", []):

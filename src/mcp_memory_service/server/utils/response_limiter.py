@@ -15,9 +15,14 @@ Example:
     >>> response = format_truncated_response(truncated, meta)
 """
 
+import logging
 import os
 import warnings
 from typing import Any, Dict, List, Tuple
+
+from ...compat import _sanitize_log_value
+
+logger = logging.getLogger(__name__)
 
 # Default max response size (can be overridden by environment variable)
 # 0 = unlimited (for backward compatibility)
@@ -316,3 +321,28 @@ def safe_retrieve_response(
         True
     """
     return apply_response_limit(memories, max_chars)
+
+
+def get_max_response_chars(arguments: dict) -> int:
+    """Get max_response_chars from arguments or environment variable default.
+
+    Priority:
+    1. Explicit argument value
+    2. MCP_MAX_RESPONSE_CHARS environment variable
+    3. 0 (unlimited)
+    """
+    explicit = arguments.get("max_response_chars")
+    if explicit is not None:
+        try:
+            return int(explicit)
+        except (ValueError, TypeError, OverflowError):
+            logger.warning("Invalid max_response_chars value: %s", _sanitize_log_value(explicit))
+
+    env_default = os.environ.get("MCP_MAX_RESPONSE_CHARS")
+    if env_default:
+        try:
+            return int(env_default)
+        except (ValueError, OverflowError):
+            logger.warning("Invalid MCP_MAX_RESPONSE_CHARS value: %s", _sanitize_log_value(env_default))
+
+    return 0  # Unlimited

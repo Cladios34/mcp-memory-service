@@ -294,9 +294,16 @@ _MISTAKE_SEARCH_METADATA_KEYS = (
 )
 
 
+# Zero-width characters a model can emit in place of text: they make a field look filled.
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+
+
 def _blank_mistake_fields(**fields: Optional[str]) -> Optional[str]:
     """Return an error message naming the blank mistake-note fields, or None if all are filled."""
-    blank = [name for name, value in fields.items() if not (value or "").strip()]
+    blank = [
+        name for name, value in fields.items()
+        if not isinstance(value, str) or not value.translate(_ZERO_WIDTH).strip()
+    ]
     if not blank:
         return None
     return (

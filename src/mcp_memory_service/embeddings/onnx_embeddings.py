@@ -5,6 +5,7 @@ Based on ONNXMiniLM_L6_V2 implementation.
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -310,20 +311,25 @@ class ONNXEmbeddingModel:
     def _max_input_tokens(self) -> int:
         """Longest input the model accepts, read from its config.json (default 512).
 
-        RoBERTa-family models reserve two position slots (padding offset), so their
-        usable length is max_position_embeddings - 2 (514 -> 512).
+        RoBERTa-family models (and MPNet) reserve two position slots (padding offset), so
+        their usable length is max_position_embeddings - 2 (514 -> 512).
         """
         config_path = (self.DOWNLOAD_PATH / self.EXTRACTED_FOLDER_NAME / "config.json"
                        if self._is_default_model else self._model_dir / "config.json")
         try:
-            import json
             with open(config_path, encoding="utf-8") as fh:
                 config = json.load(fh)
+            if not isinstance(config, dict):
+                raise ValueError("config.json is not an object")
             limit = int(config.get("max_position_embeddings") or 512)
-            if config.get("model_type") in ("roberta", "xlm-roberta", "camembert"):
+            if config.get("model_type") in ("roberta", "xlm-roberta", "camembert", "mpnet"):
                 limit -= 2
             return max(8, limit)
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, OverflowError) as exc:
+            logger.warning(
+                "Could not read the model input limit from %s (%s); capping at 512 tokens",
+                _sanitize_log_value(config_path), _sanitize_log_value(exc),
+            )
             return 512
 
     def encode(self, texts: Union[str, List[str]], convert_to_numpy: bool = True) -> np.ndarray:

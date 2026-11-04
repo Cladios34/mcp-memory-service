@@ -708,6 +708,8 @@ async def test_mistake_note_search_returns_only_lesson_metadata(memory_service):
     ("   ", "some context", "error_pattern"),
     ("A real symptom", "", "context_signature"),
     ("", "", "error_pattern and context_signature"),
+    ("\u200b\ufeff", "some context", "error_pattern"),
+    (5, "some context", "error_pattern"),
 ])
 async def test_mistake_note_add_rejects_blank_key_fields(memory_service, pattern, context, named):
     """84 stored notes had a blank Pattern/Context: they can be neither found nor deduplicated (2026-11-04)."""

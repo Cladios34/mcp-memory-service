@@ -14,7 +14,7 @@ from typing import List
 
 from mcp import types
 
-from .memory import _get_max_response_chars
+from ..utils.response_limiter import get_max_response_chars
 
 logger = logging.getLogger(__name__)
 
@@ -52,52 +52,39 @@ async def handle_mistake_note_search(server, arguments: dict) -> List[types.Text
         query=arguments.get("query", ""),
         limit=arguments.get("limit", 5),
     )
-    return _to_text(_limit_notes(result, _get_max_response_chars(arguments)))
+    return _to_text(_limit_notes(result, get_max_response_chars(arguments)))
 
 
 def _limit_notes(result: dict, max_chars: int) -> dict:
-    """Drop trailing notes until the serialized result fits in max_chars (0 = no limit).
+    """Keep the longest prefix of notes whose serialized result fits in max_chars (0 = no limit).
 
     WHY(2026-11-04): memory_search honoured max_response_chars but mistake_note_search
-    ignored it, so a caller had no way to bound the payload. Notes are dropped whole,
-    best match kept first, and the first note is always returned: a lesson cut in the
-    middle is worse than a slightly long answer. The `truncated` block says what was cut.
+    ignored it, so a caller had no way to bound the payload. Notes are dropped whole from
+    the end (best match kept first) and the first note is always returned: a lesson cut in
+    the middle is worse than a slightly long answer. A `truncated` block appears only when
+    notes were dropped; a single over-long first note is flagged with `exceeds_limit`.
+    The fitting prefix is found by bisection (the size grows with the prefix length).
     """
     notes = result.get("notes") or []
     if max_chars <= 0 or not notes or len(_dump(result)) <= max_chars:
         return result
     total = len(notes)
-    kept = list(notes)
-    trimmed = dict(result)
-    while len(kept) > 1:
-        kept.pop()
-        trimmed = {**result, "notes": kept, "count": len(kept),
-                   "truncated": {"shown": len(kept), "total": total, "max_response_chars": max_chars}}
-        if len(_dump(trimmed)) <= max_chars:
-            return trimmed
-    return {**result, "notes": kept, "count": len(kept),
-            "truncated": {"shown": len(kept), "total": total, "max_response_chars": max_chars,
-                          "first_note_exceeds_limit": len(_dump(trimmed)) > max_chars}}
 
+    def with_prefix(k: int) -> dict:
+        trimmed = {**result, "notes": notes[:k], "count": k}
+        if k < total:
+            trimmed["truncated"] = {"shown": k, "total": total, "max_response_chars": max_chars}
+        return trimmed
 
-async def handle_mistake_note_update(server, arguments: dict) -> List[types.TextContent]:
-    """Update fields of an existing mistake note."""
-    await server._ensure_storage_initialized()
-    result = await server.memory_service.mistake_note_update(
-        content_hash=arguments.get("content_hash", ""),
-        failure_count=arguments.get("failure_count"),
-        error_pattern=arguments.get("error_pattern"),
-        context_signature=arguments.get("context_signature"),
-        incorrect_action=arguments.get("incorrect_action"),
-        correct_action=arguments.get("correct_action"),
-    )
-    return _to_text(result)
-
-
-async def handle_mistake_note_delete(server, arguments: dict) -> List[types.TextContent]:
-    """Delete a mistake note by content hash."""
-    await server._ensure_storage_initialized()
-    result = await server.memory_service.mistake_note_delete(
-        content_hash=arguments.get("content_hash", ""),
-    )
-    return _to_text(result)
+    lo, hi = 1, total - 1  # total itself is known not to fit
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if len(_dump(with_prefix(mid))) <= max_chars:
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    out = with_prefix(best)
+    if len(_dump(out)) > max_chars:
+        out["exceeds_limit"] = True
+    return out

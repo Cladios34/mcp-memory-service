@@ -38,7 +38,7 @@ from mcp import types
 from ...config import INCLUDE_HOSTNAME
 
 # Import response limiter for truncation support
-from ..utils.response_limiter import format_truncated_response, truncate_memories
+from ..utils.response_limiter import format_truncated_response, get_max_response_chars, truncate_memories
 
 logger = logging.getLogger(__name__)
 
@@ -66,29 +66,8 @@ def _resolve_hostname(client_hostname: Optional[str]) -> Optional[str]:
         return client_hostname
 
 
-def _get_max_response_chars(arguments: dict) -> int:
-    """Get max_response_chars from arguments or environment variable default.
-
-    Priority:
-    1. Explicit argument value
-    2. MCP_MAX_RESPONSE_CHARS environment variable
-    3. 0 (unlimited)
-    """
-    explicit = arguments.get("max_response_chars")
-    if explicit is not None:
-        try:
-            return int(explicit)
-        except (ValueError, TypeError):
-            logger.warning("Invalid max_response_chars value: %s", _sanitize_log_value(explicit))
-
-    env_default = os.environ.get("MCP_MAX_RESPONSE_CHARS")
-    if env_default:
-        try:
-            return int(env_default)
-        except ValueError:
-            logger.warning("Invalid MCP_MAX_RESPONSE_CHARS value: %s", _sanitize_log_value(env_default))
-
-    return 0  # Unlimited
+# Shared with handlers/mistake_notes.py (2026-11-04); the private name stays for existing callers.
+_get_max_response_chars = get_max_response_chars
 
 
 def _memories_to_dicts(memories: list, score_key: str = 'similarity_score') -> list:

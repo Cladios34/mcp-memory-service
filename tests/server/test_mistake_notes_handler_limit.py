@@ -38,7 +38,35 @@ def test_first_note_is_kept_even_over_limit():
     r = _result(3, size=2000)
     out = _limit_notes(r, 500)
     assert [n["content_hash"] for n in out["notes"]] == ["h0"]
-    assert out["truncated"]["first_note_exceeds_limit"] is True
+    assert out["truncated"] == {"shown": 1, "total": 3, "max_response_chars": 500}
+    assert out["exceeds_limit"] is True
+
+
+def test_single_over_long_note_has_no_truncated_block():
+    """Nothing was dropped, so no `truncated` block; only the over-limit flag."""
+    out = _limit_notes(_result(1, size=2000), 500)
+    assert out["count"] == 1 and "truncated" not in out
+    assert out["exceeds_limit"] is True
+
+
+def test_bisection_matches_linear_scan():
+    """The fitting prefix found by bisection is the longest one, for every limit."""
+    r = _result(40, size=97)
+    for limit in range(150, len(_dump(r)) + 50, 37):
+        out = _limit_notes(r, limit)
+        k = out["count"]
+        assert k == 1 or len(_dump(out)) <= limit
+        if k < 40:
+            longer = {**r, "notes": r["notes"][:k + 1], "count": k + 1,
+                      "truncated": {"shown": k + 1, "total": 40, "max_response_chars": limit}}
+            assert k + 1 == 40 or len(_dump(longer)) > limit
+
+
+def test_overflowing_limit_is_ignored(monkeypatch):
+    """JSON 1e999 decodes to inf: int(inf) raised OverflowError and broke the call."""
+    from mcp_memory_service.server.utils.response_limiter import get_max_response_chars
+    monkeypatch.delenv("MCP_MAX_RESPONSE_CHARS", raising=False)
+    assert get_max_response_chars({"max_response_chars": float("inf")}) == 0
 
 
 def test_explicit_argument_and_env_default(monkeypatch):
