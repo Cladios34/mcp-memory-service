@@ -148,6 +148,14 @@ class SyncOperation:
             self.timestamp = time.time()
 
 
+# Keys a metadata update forwards to the secondary next to the full metadata (2026-11-04).
+_SECONDARY_TOP_LEVEL_UPDATE_KEYS = frozenset(
+    {"tags", "memory_type", "created_at", "created_at_iso", "updated_at", "updated_at_iso"}
+)
+# Per-device access tracking, written locally by searches and never read from the secondary.
+_LOCAL_ONLY_METADATA_KEYS = frozenset({"access_count", "access_queries", "last_accessed_at"})
+
+
 def _normalize_metadata_for_cloudflare(updates: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize metadata updates for Cloudflare storage backend.
@@ -2396,12 +2404,36 @@ class HybridMemoryStorage(MemoryStorage):
             operation = SyncOperation(
                 operation='update',
                 content_hash=content_hash,
-                updates=updates,
+                updates=await self._secondary_metadata_updates(content_hash, updates),
                 preserve_timestamps=preserve_timestamps
             )
             await self.sync_service.enqueue_operation(operation)
 
         return success, message
+
+    async def _secondary_metadata_updates(self, content_hash: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the update sent to the secondary: the memory's FULL metadata, not the delta.
+
+        GOTCHA(2026-11-04): CloudflareStorage.update_memory_metadata REPLACES metadata_json
+        with what it receives. Forwarding the caller's partial `updates` (a quality score,
+        three chunk fields...) erased every other key in D1. A device that later filled
+        itself from D1 inherited the stripped copy: measured on a new Mac, 8 214 of 11 907
+        memories had lost source_file / chunk_index / failure_count... while the older VPS,
+        whose drift pulls MERGE locally, still had them. The primary has already merged the
+        delta, so read it back and send the whole metadata. Access tracking stays local
+        (it is never synced by the read path either) and keeps the payload small.
+        Secondaries that do not need Cloudflare normalization keep the previous behaviour.
+        """
+        if not getattr(self.secondary, 'requires_metadata_normalization', False):
+            return updates
+        memory = await self.primary.get_by_hash(content_hash)
+        if memory is None:
+            return updates
+        top_level = {k: v for k, v in updates.items() if k in _SECONDARY_TOP_LEVEL_UPDATE_KEYS}
+        top_level["metadata"] = {
+            k: v for k, v in (memory.metadata or {}).items() if k not in _LOCAL_ONLY_METADATA_KEYS
+        }
+        return top_level
 
     async def mark_superseded_batch(self, pairs: list[tuple[str, str]]) -> int:
         """Mark memories as superseded in primary storage.

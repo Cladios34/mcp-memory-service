@@ -491,3 +491,45 @@ async def test_concurrent_structural_change_advances_time(
     assert success, message
     assert changed
     assert timestamp_fields(db, content_hash)[2] > concurrent_time
+
+
+@pytest.mark.asyncio
+async def test_hybrid_single_update_keeps_full_metadata_in_cloudflare(metadata_storage, temp_db_path):
+    """A partial metadata update must not erase the other keys in D1 (2026-11-04).
+
+    CloudflareStorage.update_memory_metadata replaces metadata_json. The hybrid layer used
+    to forward only the delta, so one quality-score update stripped source / chunk fields
+    from D1, and a device filled from D1 inherited the stripped copy (8 214 memories).
+    """
+    secondary, secondary_db, content_hash, metadata_column = metadata_storage
+    if metadata_column != "metadata_json":
+        pytest.skip("Cloudflare-only behaviour")
+    hybrid = HybridMemoryStorage(f"{temp_db_path}/hybrid-primary-full.db")
+    await hybrid.primary.initialize()
+    hybrid.secondary = secondary
+    hybrid.sync_service = BackgroundSyncService(hybrid.primary, secondary)
+    try:
+        memory = await secondary.get_by_hash(content_hash)
+        memory.metadata.update({"chunk_index": 1, "total_chunks": 2, "original_hash": "abc",
+                                "access_count": 7, "access_queries": [{"query": "q"}]})
+        success, message = await hybrid.primary.store(memory)
+        assert success, message
+
+        success, message = await hybrid.update_memory_metadata(
+            content_hash, {"metadata": {"quality_score": 0.9}}, preserve_timestamps=True
+        )
+        assert success, message
+        operation = hybrid.sync_service.operation_queue.get_nowait()
+        await hybrid.sync_service._process_single_operation(operation)
+        hybrid.sync_service.operation_queue.task_done()
+
+        stored = decompress_metadata_from_sync(json.loads(secondary_db.execute(
+            "SELECT metadata_json FROM memories WHERE content_hash = ?", (content_hash,)
+        ).fetchone()[0]))
+        assert stored["quality_score"] == 0.9
+        assert stored["source"] == "original"
+        assert (stored["chunk_index"], stored["total_chunks"], stored["original_hash"]) == (1, 2, "abc")
+        # Per-device access tracking is not shipped to the cloud.
+        assert "access_count" not in stored and "access_queries" not in stored
+    finally:
+        await hybrid.primary.close()
