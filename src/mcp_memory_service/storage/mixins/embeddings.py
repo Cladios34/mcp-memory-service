@@ -105,6 +105,20 @@ class _HashEmbeddingModel:
         return floats
 
 
+def with_embedding_prefix(text: str, kind: str = "passage") -> str:
+    """Prefix a text for asymmetric embedding models (e5: "query: " / "passage: ").
+
+    DECISION(2026-11-04): measured on 83 real queries over the user's base, multilingual-e5-small
+    needs the asymmetric prefixes to beat all-MiniLM-L6-v2 (recall@5 .530 -> .795); without them
+    it is no better. Read from MCP_EMBEDDING_QUERY_PREFIX / MCP_EMBEDDING_PASSAGE_PREFIX at call
+    time; both unset (default) = no prefix = previous behaviour for every existing model.
+    A stored-side prefix without the query-side one falls back to MiniLM-level results.
+    """
+    env = "MCP_EMBEDDING_QUERY_PREFIX" if kind == "query" else "MCP_EMBEDDING_PASSAGE_PREFIX"
+    prefix = os.environ.get(env, "")
+    return f"{prefix}{text}" if prefix else text
+
+
 class EmbeddingsMixin:
     """Mixin providing embedding model initialization and generation."""
 
@@ -490,8 +504,9 @@ class EmbeddingsMixin:
         self._embedding_cache_namespace = f"__hash_fallback__::{self.embedding_dimension}"
         self.embedding_backend_degraded = True
 
-    def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text."""
+    def _generate_embedding(self, text: str, kind: str = "passage") -> List[float]:
+        """Generate embedding for text. kind="query" for search inputs, "passage" (default) for stored text."""
+        text = with_embedding_prefix(text, kind)
         if not self.embedding_model:
             raise RuntimeError("No embedding model available. Ensure sentence-transformers is installed and model is loaded.")
 

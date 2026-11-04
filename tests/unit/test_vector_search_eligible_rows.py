@@ -16,7 +16,7 @@ class QueryStorage(RetrieveMixin):
         self.conn = conn
         self.embedding_model = object()
 
-    def _generate_embedding(self, query):
+    def _generate_embedding(self, query, kind="passage"):
         return [0.0, 0.0]
 
     async def _execute_with_retry(self, operation):

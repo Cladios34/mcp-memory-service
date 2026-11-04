@@ -15,6 +15,7 @@ except ImportError:
     pass
 
 from ...compat import _sanitize_log_value
+from .embeddings import with_embedding_prefix
 from ...models.memory import Memory
 from ..base import RecreateRefused
 
@@ -368,7 +369,7 @@ class StoreMixin:
         if not self.conn:
             return [(False, "Database not initialized")] * len(memories)
 
-        contents = [m.content for m in memories]
+        contents = [with_embedding_prefix(m.content, "passage") for m in memories]
         try:
             if not self.embedding_model:
                 raise RuntimeError("No embedding model available")
