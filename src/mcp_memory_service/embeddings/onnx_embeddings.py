@@ -288,6 +288,14 @@ class ONNXEmbeddingModel:
         
         # Initialize tokenizer
         self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        # GOTCHA(2026-11-04): some Hub exports (intfloat/multilingual-e5-small,
+        # onnx-community/multilingual-e5-base-ONNX) ship a tokenizer.json with no
+        # truncation, while the model only has max_position_embeddings positions.
+        # Any longer text (536 stored memories exceed 1500 chars, one is 48 687) then
+        # fails inside ONNX Runtime. Cap at the model's own limit when the tokenizer
+        # sets none; tokenizers that already truncate (all-MiniLM-L6-v2: 128) are untouched.
+        if self._tokenizer.truncation is None:
+            self._tokenizer.enable_truncation(max_length=self._max_input_tokens())
         
         # Get model info
         self.embedding_dimension = self._model.get_outputs()[0].shape[-1]
@@ -299,6 +307,25 @@ class ONNXEmbeddingModel:
             _sanitize_log_value(self.embedding_dimension),
         )
     
+    def _max_input_tokens(self) -> int:
+        """Longest input the model accepts, read from its config.json (default 512).
+
+        RoBERTa-family models reserve two position slots (padding offset), so their
+        usable length is max_position_embeddings - 2 (514 -> 512).
+        """
+        config_path = (self.DOWNLOAD_PATH / self.EXTRACTED_FOLDER_NAME / "config.json"
+                       if self._is_default_model else self._model_dir / "config.json")
+        try:
+            import json
+            with open(config_path, encoding="utf-8") as fh:
+                config = json.load(fh)
+            limit = int(config.get("max_position_embeddings") or 512)
+            if config.get("model_type") in ("roberta", "xlm-roberta", "camembert"):
+                limit -= 2
+            return max(8, limit)
+        except (OSError, ValueError, TypeError):
+            return 512
+
     def encode(self, texts: Union[str, List[str]], convert_to_numpy: bool = True) -> np.ndarray:
         """
         Generate embeddings for texts using ONNX model.

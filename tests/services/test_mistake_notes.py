@@ -699,3 +699,38 @@ async def test_mistake_note_search_returns_only_lesson_metadata(memory_service):
     # Storage still holds the access tracking: only the returned payload is trimmed.
     stored = await memory_service.storage.get_by_hash(note["content_hash"])
     assert stored.metadata.get("access_count", 0) >= 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern,context,named", [
+    ("", "some context", "error_pattern"),
+    ("   ", "some context", "error_pattern"),
+    ("A real symptom", "", "context_signature"),
+    ("", "", "error_pattern and context_signature"),
+])
+async def test_mistake_note_add_rejects_blank_key_fields(memory_service, pattern, context, named):
+    """84 stored notes had a blank Pattern/Context: they can be neither found nor deduplicated (2026-11-04)."""
+    result = await memory_service.mistake_note_add(
+        error_pattern=pattern, context_signature=context,
+        incorrect_action="whatever", correct_action="A real remediation",
+    )
+    assert result["status"] == "error"
+    assert result["message"].startswith(named)
+    search = await memory_service.mistake_note_search(query="A real remediation", limit=5)
+    assert search["count"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mistake_note_update_rejects_blanking_key_fields(memory_service):
+    created = await memory_service.mistake_note_add(
+        error_pattern="Symptom to keep", context_signature="Context to keep",
+        incorrect_action="x", correct_action="Fix to keep",
+    )
+    result = await memory_service.mistake_note_update(created["content_hash"], context_signature="  ")
+    assert result["status"] == "error"
+    assert result["message"].startswith("context_signature")
+    # Omitted fields (None) stay allowed: only an explicit blank is refused.
+    ok = await memory_service.mistake_note_update(created["content_hash"], failure_count=3)
+    assert ok["status"] != "error"

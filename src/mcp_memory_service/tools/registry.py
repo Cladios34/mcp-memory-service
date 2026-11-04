@@ -1143,6 +1143,10 @@ Examples:
                     "default": 5,
                     "description": "Max results (default: 5)",
                 },
+                "max_response_chars": {
+                    "type": "number",
+                    "description": "Maximum response size in characters. Whole notes are dropped from the end (best match kept, first note always returned) and a 'truncated' block says how many were cut. Omitted: MCP_MAX_RESPONSE_CHARS if set, else unlimited. 0: unlimited.",
+                },
             },
             "required": ["query"],
         },

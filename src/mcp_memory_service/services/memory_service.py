@@ -294,6 +294,17 @@ _MISTAKE_SEARCH_METADATA_KEYS = (
 )
 
 
+def _blank_mistake_fields(**fields: Optional[str]) -> Optional[str]:
+    """Return an error message naming the blank mistake-note fields, or None if all are filled."""
+    blank = [name for name, value in fields.items() if not (value or "").strip()]
+    if not blank:
+        return None
+    return (
+        f"{' and '.join(blank)} must not be empty: describe the symptom (error_pattern) and "
+        "where it happened (context_signature) so the note can be found and deduplicated"
+    )
+
+
 class MemoryService:
     """
     Shared service for memory operations with consistent business logic.
@@ -1477,6 +1488,12 @@ class MemoryService:
                 "status": "error",
                 "message": "correct_action must not be empty — a mistake note requires a remediation, not just an error pattern",
             }
+        # WHY(2026-11-04): error_pattern + context_signature are the dedup query and what
+        # a later search matches on. Blank strings passed the JSON-schema `required` check
+        # and produced 84 notes that can be neither deduplicated nor recognised.
+        blank = _blank_mistake_fields(error_pattern=error_pattern, context_signature=context_signature)
+        if blank:
+            return {"status": "error", "message": blank}
 
         ERROR_WEIGHT = float(os.getenv("MCP_ERROR_WEIGHT", "3.0"))
         LEARNING_RATE = float(os.getenv("MCP_LEARNING_RATE", "0.1"))
@@ -1697,6 +1714,12 @@ class MemoryService:
                 "status": "error",
                 "message": "correct_action must not be empty — a mistake note requires a remediation, not just an error pattern",
             }
+        # Same rule as mistake_note_add: an update may not blank the dedup key fields.
+        blank = _blank_mistake_fields(
+            **{k: v for k, v in (("error_pattern", error_pattern), ("context_signature", context_signature)) if v is not None}
+        )
+        if blank:
+            return {"status": "error", "message": blank}
 
         try:
             mem = await self.storage.get_by_hash(content_hash)

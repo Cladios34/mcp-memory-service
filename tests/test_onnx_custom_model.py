@@ -136,3 +136,88 @@ def test_default_model_name_never_validated(monkeypatch):
     m = _make_without_io(monkeypatch, "all-MiniLM-L6-v2")
     assert m._is_default_model is True
 
+
+
+def _tiny_tokenizer(truncation=None):
+    """A real tokenizers.Tokenizer (word-level, no files) for truncation tests."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    vocab = {"[UNK]": 0, **{f"w{i}": i + 1 for i in range(2000)}}
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    if truncation:
+        tok.enable_truncation(max_length=truncation)
+    return tok
+
+
+@pytest.mark.parametrize("model_type,max_pos,expected", [
+    ("bert", 512, 512),            # intfloat/multilingual-e5-small
+    ("xlm-roberta", 514, 512),     # multilingual-e5-base: 2 slots reserved
+])
+def test_max_input_tokens_reads_model_config(monkeypatch, tmp_path, model_type, max_pos, expected):
+    """The safeguard limit comes from the model's own config.json (2026-11-04)."""
+    import json
+    m = _make_without_io(monkeypatch, "multilingual-e5-small")
+    m._model_dir = tmp_path
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type, "max_position_embeddings": max_pos}))
+    assert m._max_input_tokens() == expected
+
+
+def test_max_input_tokens_defaults_without_config(monkeypatch, tmp_path):
+    m = _make_without_io(monkeypatch, "multilingual-e5-small")
+    m._model_dir = tmp_path  # no config.json
+    assert m._max_input_tokens() == 512
+
+
+def test_tokenizer_without_truncation_gets_capped(monkeypatch, tmp_path):
+    """A Hub tokenizer.json with no truncation is capped at the model limit, so a
+    48 687-char memory no longer overflows the position embeddings (2026-11-04)."""
+    import json
+    from mcp_memory_service.embeddings import onnx_embeddings as mod
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "bert", "max_position_embeddings": 16}))
+    (tmp_path / "tokenizer.json").write_text(_tiny_tokenizer().to_str())
+    (tmp_path / "model.onnx").write_bytes(b"")
+
+    class _FakeSession:
+        def __init__(self, *a, **k): pass
+        def get_outputs(self):
+            class O: shape = [None, None, 8]
+            return [O()]
+        def get_inputs(self): return []
+
+    monkeypatch.setattr(mod.ort, "InferenceSession", _FakeSession)
+    monkeypatch.setattr(mod.ONNXEmbeddingModel, "_download_model_if_needed", lambda self: None)
+    monkeypatch.setattr(mod.ONNXEmbeddingModel, "_find_onnx_file", lambda self: tmp_path / "model.onnx")
+    m = mod.ONNXEmbeddingModel.__new__(mod.ONNXEmbeddingModel)
+    m.model_name, m._is_default_model, m._model_dir = "multilingual-e5-small", False, tmp_path
+    m._preferred_providers = ["CPUExecutionProvider"]
+    m._init_model()
+
+    long_text = " ".join(f"w{i}" for i in range(1000))
+    assert len(m._tokenizer.encode(long_text).ids) == 16
+
+
+def test_tokenizer_with_own_truncation_is_untouched(monkeypatch, tmp_path):
+    """all-MiniLM-L6-v2 ships truncation=128: the safeguard must not change it."""
+    import json
+    from mcp_memory_service.embeddings import onnx_embeddings as mod
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "bert", "max_position_embeddings": 512}))
+    (tmp_path / "tokenizer.json").write_text(_tiny_tokenizer(truncation=128).to_str())
+    (tmp_path / "model.onnx").write_bytes(b"")
+
+    class _FakeSession:
+        def __init__(self, *a, **k): pass
+        def get_outputs(self):
+            class O: shape = [None, None, 8]
+            return [O()]
+        def get_inputs(self): return []
+
+    monkeypatch.setattr(mod.ort, "InferenceSession", _FakeSession)
+    monkeypatch.setattr(mod.ONNXEmbeddingModel, "_find_onnx_file", lambda self: tmp_path / "model.onnx")
+    m = mod.ONNXEmbeddingModel.__new__(mod.ONNXEmbeddingModel)
+    m.model_name, m._is_default_model, m._model_dir = "multilingual-e5-small", False, tmp_path
+    m._preferred_providers = ["CPUExecutionProvider"]
+    m._init_model()
+
+    assert len(m._tokenizer.encode(" ".join(f"w{i}" for i in range(1000))).ids) == 128

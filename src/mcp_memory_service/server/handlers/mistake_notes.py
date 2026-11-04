@@ -14,7 +14,13 @@ from typing import List
 
 from mcp import types
 
+from .memory import _get_max_response_chars
+
 logger = logging.getLogger(__name__)
+
+
+def _dump(result: dict) -> str:
+    return json.dumps(result, default=str, ensure_ascii=False, separators=(",", ":"))
 
 
 def _to_text(result: dict) -> List[types.TextContent]:
@@ -24,8 +30,7 @@ def _to_text(result: dict) -> List[types.TextContent]:
     six-character \\uXXXX escapes, and compact separators drop the indentation. Measured on
     five real searches: about 11 % fewer characters for the same content.
     """
-    return [types.TextContent(type="text", text=json.dumps(
-        result, default=str, ensure_ascii=False, separators=(",", ":")))]
+    return [types.TextContent(type="text", text=_dump(result))]
 
 
 async def handle_mistake_note_add(server, arguments: dict) -> List[types.TextContent]:
@@ -47,7 +52,32 @@ async def handle_mistake_note_search(server, arguments: dict) -> List[types.Text
         query=arguments.get("query", ""),
         limit=arguments.get("limit", 5),
     )
-    return _to_text(result)
+    return _to_text(_limit_notes(result, _get_max_response_chars(arguments)))
+
+
+def _limit_notes(result: dict, max_chars: int) -> dict:
+    """Drop trailing notes until the serialized result fits in max_chars (0 = no limit).
+
+    WHY(2026-11-04): memory_search honoured max_response_chars but mistake_note_search
+    ignored it, so a caller had no way to bound the payload. Notes are dropped whole,
+    best match kept first, and the first note is always returned: a lesson cut in the
+    middle is worse than a slightly long answer. The `truncated` block says what was cut.
+    """
+    notes = result.get("notes") or []
+    if max_chars <= 0 or not notes or len(_dump(result)) <= max_chars:
+        return result
+    total = len(notes)
+    kept = list(notes)
+    trimmed = dict(result)
+    while len(kept) > 1:
+        kept.pop()
+        trimmed = {**result, "notes": kept, "count": len(kept),
+                   "truncated": {"shown": len(kept), "total": total, "max_response_chars": max_chars}}
+        if len(_dump(trimmed)) <= max_chars:
+            return trimmed
+    return {**result, "notes": kept, "count": len(kept),
+            "truncated": {"shown": len(kept), "total": total, "max_response_chars": max_chars,
+                          "first_note_exceeds_limit": len(_dump(trimmed)) > max_chars}}
 
 
 async def handle_mistake_note_update(server, arguments: dict) -> List[types.TextContent]:
