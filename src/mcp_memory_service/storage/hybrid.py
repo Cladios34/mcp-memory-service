@@ -1097,6 +1097,7 @@ class BackgroundSyncService:
         had them. So send the full current metadata, read HERE at send time, not at enqueue:
         a retried or reordered operation then ships today's state instead of overwriting a
         newer one with an old snapshot (same rule as _get_current_queued_store_memory).
+        Tags and memory_type, when the operation carries them, are taken from the same row.
         A missing row is skipped only if it is really gone; an unreadable live row raises so
         the retry path runs. Never fall back to the delta. Per-device access tracking stays
         local (it is never read from the secondary) and keeps the payload small.
@@ -1109,10 +1110,19 @@ class BackgroundSyncService:
                 logger.debug("Skipping queued update for %s: primary row is no longer live",
                              _sanitize_log_value(operation.content_hash[:16]))
                 return None
-            raise RuntimeError(
-                f"Could not read the primary row for queued update {operation.content_hash[:16]}"
-            )
+            # GOTCHA(2026-11-04): keep digits out of the message. _handle_sync_error
+            # classifies by substring ('413', '507' = capacity): a hash like a413... in the
+            # text would skip the retry this raise exists for. The hash goes to the log.
+            logger.warning("Primary row unreadable for queued update %s; will retry",
+                           _sanitize_log_value(operation.content_hash[:16]))
+            raise RuntimeError("Could not read the primary row for a queued update")
         top_level = {k: v for k, v in operation.updates.items() if k in _SECONDARY_TOP_LEVEL_UPDATE_KEYS}
+        # Tags and type are also replaced on the secondary: ship today's values, not the
+        # queued ones, so a replayed older operation cannot roll them back either.
+        if "tags" in top_level:
+            top_level["tags"] = list(memory.tags or [])
+        if "memory_type" in top_level:
+            top_level["memory_type"] = memory.memory_type
         top_level["metadata"] = {
             k: v for k, v in (memory.metadata or {}).items() if k not in _LOCAL_ONLY_METADATA_KEYS
         }

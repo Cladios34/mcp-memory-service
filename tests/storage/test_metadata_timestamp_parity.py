@@ -626,3 +626,44 @@ async def test_oversized_metadata_still_ships_tags(metadata_storage, temp_db_pat
         assert sent and "metadata" not in sent[0] and sent[0]["tags"] == ["new-tag"]
     finally:
         await hybrid.primary.close()
+
+
+@pytest.mark.asyncio
+async def test_retried_old_update_does_not_roll_back_tags_or_type(metadata_storage, temp_db_path):
+    """Tags and memory_type are replaced on D1 too: they are read at send time as well."""
+    hybrid, secondary, secondary_db, content_hash = await _hybrid_on(metadata_storage, temp_db_path, "retry-tags")
+    try:
+        await hybrid.update_memory_metadata(content_hash, {"tags": ["a"], "memory_type": "note"})
+        op_a = hybrid.sync_service.operation_queue.get_nowait()
+        await hybrid.update_memory_metadata(content_hash, {"tags": ["a", "b"], "memory_type": "decision"})
+        op_b = hybrid.sync_service.operation_queue.get_nowait()
+        await hybrid.sync_service._process_single_operation(op_b)
+        await hybrid.sync_service._process_single_operation(op_a)  # replayed late
+        synced = await secondary.get_by_hash(content_hash)
+        assert set(synced.tags) == {"a", "b"} and synced.memory_type == "decision"
+    finally:
+        await hybrid.primary.close()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_row_error_goes_through_retry_even_for_digit_hashes(metadata_storage, temp_db_path, monkeypatch):
+    """The raised message carries no hash digits, so '413'/'507' capacity matching cannot swallow it."""
+    hybrid, secondary, secondary_db, content_hash = await _hybrid_on(metadata_storage, temp_db_path, "digits")
+    try:
+        await hybrid.update_memory_metadata(content_hash, {"metadata": {"x": 1}})
+        op = hybrid.sync_service.operation_queue.get_nowait()
+        op.content_hash = "a413507" + op.content_hash[7:]  # a hash that contains both markers
+
+        async def broken_read(*args, **kwargs):
+            return None
+
+        async def live_state(*args, **kwargs):
+            return (1.0, None)
+        monkeypatch.setattr(hybrid.primary, "get_by_hash", broken_read)
+        monkeypatch.setattr(hybrid.primary, "get_sync_state_for_hash", live_state)
+        with pytest.raises(RuntimeError) as excinfo:
+            await hybrid.sync_service._current_secondary_updates(op)
+        message = str(excinfo.value).lower()
+        assert "413" not in message and "507" not in message
+    finally:
+        await hybrid.primary.close()
