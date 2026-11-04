@@ -65,6 +65,7 @@ CONSOLIDATION_CONFIG = {
     # 'auto' = dbscan when scikit-learn is installed, simple otherwise. Naming
     # 'dbscan'/'hierarchical' without scikit-learn is a hard error, not a downgrade.
     'clustering_algorithm': os.getenv('MCP_CLUSTERING_ALGORITHM', 'auto'),  # 'auto', 'dbscan', 'hierarchical', 'simple'
+    'eps_floor': float(os.getenv('MCP_CLUSTERING_EPS_FLOOR', '0.05')),
     
     # Compression settings
     'compression_enabled': os.getenv('MCP_COMPRESSION_ENABLED', 'true').lower() == 'true',

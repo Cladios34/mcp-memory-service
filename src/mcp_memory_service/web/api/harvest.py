@@ -30,7 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ...harvest.harvester import SessionHarvester
-from ...harvest.models import HARVEST_TYPES, HarvestConfig, MAX_CANDIDATE_PREVIEW_LENGTH
+from ...harvest.models import HARVEST_TYPES, MAX_CANDIDATE_PREVIEW_LENGTH, harvest_config_from_env
 from ..oauth.middleware import AuthenticationResult, require_write_access
 
 logger = logging.getLogger(__name__)
@@ -142,7 +142,8 @@ async def harvest_sessions(
             detail=f"Project directory not found: {project_path}",
         )
 
-    config = HarvestConfig(
+    # Same rule as the MCP tool (2026-11-04): honour MCP_HARVEST_* env thresholds.
+    config = harvest_config_from_env(
         sessions=request.sessions,
         session_ids=request.session_ids,
         types=request.types,

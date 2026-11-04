@@ -66,3 +66,26 @@ def test_conflict_threshold_from_env(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv("MCP_CONFLICT_SIMILARITY_THRESHOLD", raw)
     assert _conflict_similarity_threshold() == expected
+
+
+def test_harvest_tool_and_route_honour_env_threshold(monkeypatch):
+    """The MCP tool and the REST route used HarvestConfig(...) and evolved at 0.85 whatever
+    MCP_HARVEST_SIMILARITY_THRESHOLD said; under e5 that superseded unrelated memories (2026-11-04)."""
+    import inspect
+    from mcp_memory_service import server_impl
+    from mcp_memory_service.web.api import harvest as harvest_api
+    from mcp_memory_service.harvest.models import harvest_config_from_env
+    for module in (server_impl, harvest_api):
+        assert "config = harvest_config_from_env(" in inspect.getsource(module)
+    monkeypatch.setenv("MCP_HARVEST_SIMILARITY_THRESHOLD", "0.98")
+    assert harvest_config_from_env(sessions=1, dry_run=False).similarity_threshold == 0.98
+
+
+def test_clustering_eps_floor_is_configurable():
+    pytest.importorskip("sklearn")  # _estimate_eps uses NearestNeighbors (installed in production)
+    import numpy as np
+    from mcp_memory_service.consolidation.clustering import SemanticClusteringEngine
+    rng = np.random.default_rng(0)
+    tight = rng.normal(size=(40, 8)) * 0.001 + 1.0  # near-identical vectors: tiny k-distances
+    assert SemanticClusteringEngine._estimate_eps(tight, 2) == 0.05
+    assert SemanticClusteringEngine._estimate_eps(tight, 2, floor=0.02) == 0.02

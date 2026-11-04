@@ -94,6 +94,7 @@ class SemanticClusteringEngine(ConsolidationBase):
     def __init__(self, config: ConsolidationConfig):
         super().__init__(config)
         self.min_cluster_size = config.min_cluster_size
+        self.eps_floor = getattr(config, 'eps_floor', 0.05)
         self.algorithm = resolve_clustering_algorithm(config.clustering_algorithm)
 
         if self.algorithm != config.clustering_algorithm:
@@ -141,7 +142,7 @@ class SemanticClusteringEngine(ConsolidationBase):
         _require_sklearn('dbscan')
 
         min_samples = max(2, self.min_cluster_size // 2)
-        eps = self._estimate_eps(embeddings, min_samples)
+        eps = self._estimate_eps(embeddings, min_samples, floor=self.eps_floor)
 
         clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine')
         labels = clustering.fit_predict(embeddings)
@@ -150,7 +151,7 @@ class SemanticClusteringEngine(ConsolidationBase):
         return labels
 
     @staticmethod
-    def _estimate_eps(embeddings: np.ndarray, min_samples: int) -> float:
+    def _estimate_eps(embeddings: np.ndarray, min_samples: int, floor: float = 0.05) -> float:
         """Pick DBSCAN's eps from the data's own k-distance curve.
 
         The previous formula derived eps purely from dataset size
@@ -199,7 +200,7 @@ class SemanticClusteringEngine(ConsolidationBase):
         y = (sorted_k_distances - sorted_k_distances[0]) / y_range if y_range > 1e-12 else x
         knee_index = int(np.argmax(y - x))
 
-        return max(float(sorted_k_distances[knee_index]), 0.05)
+        return max(float(sorted_k_distances[knee_index]), floor)
     
     async def _hierarchical_clustering(self, embeddings: np.ndarray) -> np.ndarray:
         """Perform hierarchical clustering on embeddings."""

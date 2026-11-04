@@ -2000,7 +2000,7 @@ class MemoryServer:
         import os  # inline import: only needed on this branch
         from pathlib import Path as _Path
         from .harvest.harvester import SessionHarvester
-        from .harvest.models import HarvestConfig, MAX_CANDIDATE_PREVIEW_LENGTH
+        from .harvest.models import MAX_CANDIDATE_PREVIEW_LENGTH, harvest_config_from_env
 
         # Resolve project directory
         project_path = arguments.get("project_path")
@@ -2029,7 +2029,11 @@ class MemoryServer:
                 text=json.dumps({"error": f"Project directory not found: {project_path}"})
             )]
 
-        config = HarvestConfig(
+        # GOTCHA(2026-11-04): built with HarvestConfig(...) this path ignored
+        # MCP_HARVEST_SIMILARITY_THRESHOLD and evolved at the 0.85 default; under
+        # multilingual-e5 unrelated texts score ~0.93, so a real run superseded
+        # unrelated memories (measured on a copy). Read the env like auto_capture does.
+        config = harvest_config_from_env(
             sessions=arguments.get("sessions", 1),
             session_ids=arguments.get("session_ids"),
             types=arguments.get("types", ["decision", "bug", "convention", "learning", "context"]),

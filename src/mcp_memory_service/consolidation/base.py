@@ -83,6 +83,10 @@ class ConsolidationConfig:
     clustering_enabled: bool = True
     min_cluster_size: int = 5
     clustering_algorithm: str = 'auto'  # 'auto', 'dbscan', 'hierarchical', 'simple'
+    # Lower bound of the adaptive DBSCAN eps (cosine distance). 0.05 suits MiniLM; with
+    # multilingual-e5 the estimated eps is ~0.056-0.084 on a 12k base, so 0.05 would soon
+    # take over and merge clusters: use ~0.02 there (MCP_CLUSTERING_EPS_FLOOR, 2026-11-04).
+    eps_floor: float = 0.05
     
     # Compression settings
     compression_enabled: bool = True
