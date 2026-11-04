@@ -16,14 +16,41 @@ logger = logging.getLogger(__name__)
 VALID_TYPES = {"decision", "bug", "convention", "learning", "context"}
 
 
+# Claude 5+ models (claude-haiku-5-5, claude-sonnet-5, claude-opus-5-5...), with or without a
+# router prefix such as "anthropic/". Group 1 = family, group 2 = major version.
+_CLAUDE_MODEL_RE = re.compile(r"(?:^|/)claude-([a-z]+)-(\d+)")
+
+
+def _claude5_family(model: str) -> Optional[str]:
+    """Family name ("haiku", "sonnet"...) of a Claude 5+ model, else None."""
+    m = _CLAUDE_MODEL_RE.search(model)
+    return m.group(1) if m and int(m.group(2)) >= 5 else None
+
+
 def build_openai_compatible_payload(model: str, messages: list, max_tokens: int, temperature: float) -> dict:
-    """Build a chat-completions payload compatible with GPT-5 reasoning models."""
+    """Build a chat-completions payload compatible with GPT-5 reasoning models and Claude 5."""
     payload = {"model": model, "stream": False, "messages": messages}
     if model.startswith("gpt-5"):
         payload["max_completion_tokens"] = max_tokens + 800
-    else:
+        return payload
+    family = _claude5_family(model)
+    if family is None:
         payload["temperature"] = temperature
         payload["max_tokens"] = max_tokens
+        return payload
+    # GOTCHA(2026-11-04): on Anthropic's OpenAI-compatible endpoint, Claude 5 models answer 400
+    # "`temperature` is deprecated for this model", and they think by default: hidden thinking
+    # counts against max_tokens, so a one-word NLI answer came back EMPTY (finish_reason=length)
+    # about once in ten calls. Callers swallow both failures (NLI falls back to the heuristic),
+    # so the feature looked enabled while never reaching the LLM.
+    # Haiku 5.5 accepts thinking "disabled" at its default effort (measured: 6 tokens instead of
+    # ~70, same answers). Sonnet/Opus 5.5 and Fable reject it (400), so they get headroom instead,
+    # like the gpt-5 branch.
+    if family == "haiku":
+        payload["thinking"] = {"type": "disabled"}
+        payload["max_tokens"] = max_tokens
+    else:
+        payload["max_tokens"] = max_tokens + 800
     return payload
 
 # Models sometimes echo the literal placeholder word "TYPE" or "<type>" from the prompt
