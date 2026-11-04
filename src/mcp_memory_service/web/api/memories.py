@@ -748,7 +748,7 @@ async def resonance_search(
         store = resolve_store(request.store)
         # ponytail: full scan in pure Python per request, O(n·dim); cache waveforms if stores grow past ~50k.
         rows = await backend._execute_with_retry(lambda: _fetch_resonance_candidates(backend.conn, store))
-        query_embedding = await asyncio.to_thread(backend._generate_embedding, request.query)
+        query_embedding = await asyncio.to_thread(backend._generate_embedding, request.query, "query")
         results, scored = await asyncio.to_thread(
             _score_resonance_candidates, rows, query_embedding, backend.embedding_dimension, request.top_k, request.mode
         )

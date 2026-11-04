@@ -55,3 +55,14 @@ async def test_store_uses_passage_and_search_uses_query(monkeypatch, temp_db_pat
         assert not any(t.startswith("passage: query:") or t == "chercher une note" for t in model.seen)
     finally:
         await storage.close()
+
+
+@pytest.mark.parametrize("raw,expected", [(None, 0.95), ("0.985", 0.985), ("abc", 0.95), ("0", 0.95), ("1.5", 0.95)])
+def test_conflict_threshold_from_env(monkeypatch, raw, expected):
+    """Conflict detection compares raw cosine: the threshold must follow the model (2026-11-04)."""
+    from mcp_memory_service.storage.mixins.metadata import _conflict_similarity_threshold
+    if raw is None:
+        monkeypatch.delenv("MCP_CONFLICT_SIMILARITY_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("MCP_CONFLICT_SIMILARITY_THRESHOLD", raw)
+    assert _conflict_similarity_threshold() == expected

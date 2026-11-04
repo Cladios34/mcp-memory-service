@@ -20,6 +20,15 @@ from ...compat import _sanitize_log_value
 logger = logging.getLogger(__name__)
 
 
+def _conflict_similarity_threshold() -> float:
+    """Cosine above which two stored memories are compared for a conflict (default 0.95)."""
+    try:
+        value = float(os.environ.get("MCP_CONFLICT_SIMILARITY_THRESHOLD", "0.95"))
+    except ValueError:
+        return 0.95
+    return value if 0.0 < value <= 1.0 else 0.95
+
+
 class MetadataMixin:
     """Mixin providing metadata updates, conflict detection, versioning, and staleness."""
 
@@ -460,7 +469,11 @@ class MetadataMixin:
         """Detect conflicting active memories for a newly stored memory."""
         from difflib import SequenceMatcher
 
-        SIMILARITY_THRESHOLD = 0.95
+        # GOTCHA(2026-11-04): raw cosine, so it depends on the embedding model. multilingual-e5
+        # compresses the scale (paraphrases ~0.965, unrelated ~0.75): 0.95 would tag plain
+        # rephrasings as conflicts after every store. Quantile-matched to the MiniLM 0.95 share
+        # on the real base: 0.983 for e5 (set via MCP_CONFLICT_SIMILARITY_THRESHOLD).
+        SIMILARITY_THRESHOLD = _conflict_similarity_threshold()
         DIVERGENCE_THRESHOLD = 0.20
 
         if not self.conn or embedding is None:
